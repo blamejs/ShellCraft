@@ -1,0 +1,13 @@
+ShellCraft app icon (shellcraft.svg and every file derived from it in this directory:
+shellcraft-1024.png, shellcraft.icns, shellcraft.ico and hicolor/).
+
+This is the sea otter, ShellCraft's icon, made by blamejs. All rights reserved. It is NOT
+covered by ShellCraft's MIT OR Apache-2.0 license.
+
+You may use it unchanged to identify ShellCraft itself: in builds made from this repository,
+in packages that redistribute those builds, and in articles, reviews and documentation about
+ShellCraft. A fork or a modified version distributed under another name, and any other
+product, must replace it with its own icon.
+
+Scripts in this repository that render these files are tools, covered by the repository's
+MIT OR Apache-2.0 license.

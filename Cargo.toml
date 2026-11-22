@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = ["xtask"]
+
+# Inherited by the `shellcraft-*` crates and `xtask`. The standalone `craft-<name>` crates set their own
+# package fields (AGENTS.md › `craft-<name>` crates).
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/blamejs/ShellCraft"
+
+[workspace.dependencies]
+# Shared Craft crates: storytold/craft-libs, MIT OR Apache-2.0, pinned to one rev.
+craft-xtask = { git = "https://github.com/storytold/craft-libs", rev = "c42c34bfa127b095fb0a8d5ccaba0c168c254062", features = ["report"] }
+craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "c42c34bfa127b095fb0a8d5ccaba0c168c254062" }
+
+# The `cargo metadata` output that xtask reads.
+serde_json = "1"
+# `cargo xtask version set`: changes the workspace version and keeps the rest of Cargo.toml as it is.
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+# Shipped code returns `Result` or `Option` instead of panicking. Tests may unwrap (clippy.toml).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
