@@ -3,6 +3,7 @@
 //! The steps run through `craft-xtask`'s runner, which runs them in order, stops at the first
 //! failure and prints a summary. Each step also runs on its own, for example `cargo xtask clippy`.
 
+mod layers;
 mod version;
 mod wasm;
 mod workspace;
@@ -17,7 +18,7 @@ use craft_xtask::runner::{self, RunOptions, Step, StepLog, TestMode};
 const XTASK_PACKAGE: &str = "xtask";
 
 /// The steps of `cargo xtask ci`, in the order they run.
-const CI_STEPS: &[&str] = &["fmt", "clippy", "test", "wasm"];
+const CI_STEPS: &[&str] = &["fmt", "clippy", "test", "layers", "wasm"];
 
 const USAGE: &str = "\
 usage: cargo xtask <command>
@@ -26,8 +27,9 @@ commands:
   fmt        cargo fmt --all -- --check
   clippy     cargo clippy --workspace --all-targets -- -D warnings
   test       the workspace tests, then the tests of this xtask package
+  layers     the crate layers, the apps' banned dependencies and the manifest rules (AGENTS.md)
   wasm       cargo check --target wasm32-unknown-unknown for the crates that build for the web
-  ci         fmt, clippy, test and wasm in that order, stopping at the first failure (wasm is left
+  ci         fmt, clippy, test, layers and wasm in that order, stopping at the first failure (wasm is left
              out while no crate builds for the web); `ci --report <file>` also writes the result
              of each step to <file> as JSON
   version    print the workspace version; `version set <version>` changes it and Cargo.lock
@@ -103,6 +105,7 @@ fn step<'a>(root: &'a Path, name: &str) -> Option<Step<'a>> {
         "fmt" => Step::new("fmt", move |log| fmt(root, log)),
         "clippy" => Step::new("clippy", move |log| clippy(root, log)),
         "test" => Step::new("test", move |log| test(root, log)),
+        "layers" => Step::new("layers", move |log| layers::run(root, log)),
         "wasm" => Step::new("wasm", move |log| wasm::run(root, log, wasm::crates())),
         _ => return None,
     };

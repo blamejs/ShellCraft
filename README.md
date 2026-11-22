@@ -21,6 +21,7 @@ cargo xtask ci
 | `fmt` | `cargo fmt --all -- --check` |
 | `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | `test` | the workspace tests, then the tests of the `xtask` package |
+| `layers` | each crate depends only on crates in its own layer or a lower one, and the crate manifests follow the rules in `AGENTS.md` |
 | `wasm` | the crates that build for the web compile for `wasm32-unknown-unknown` |
 
 Each step also runs on its own, for example `cargo xtask clippy`. The `wasm` step needs the target:

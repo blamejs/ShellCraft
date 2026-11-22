@@ -96,6 +96,14 @@ Each crate belongs to one layer and depends only on crates in its own layer or a
 | L6 | The UI. Only L6 crates may depend on `egui`, `eframe`, `winit` or `rfd` |
 
 Every crate has a row in the table below, added by the pull request that adds the crate.
+`cargo xtask layers` reads this table and fails on a crate without a row, a dependency on a crate in
+a higher layer or on a tooling crate, and a dependency on `egui`, `eframe`, `winit`, `rfd` or an
+`egui_` or `egui-` crate from a crate below L6. It checks the dependencies Cargo resolves with every
+feature on, dev- and build-dependencies included. It also checks what each crate reaches through
+packages outside the workspace when it is built on its own (`cargo tree -p` with all its features)
+for each release target and for `wasm32-unknown-unknown`, build-dependencies and proc-macro crates
+included. Cargo resolves build-dependencies and proc-macro crates for the machine that runs the
+check, so CI checks them for its Linux, macOS and Windows runners.
 
 | Crate | Layer |
 |-------|-------|
@@ -105,7 +113,11 @@ The GUI, `apps/shellcraft`, must not link tokio, russh, tokio-postgres, rusqlite
 `craft-keywrap`, `craft-scrub`, `craft-term-grid`, `craft-oauth`, `craft-chat`'s `http` feature or
 `craft-chat-store`. The GUI never holds a provider credential and never parses session output. It
 links `craft-keystore` and `chacha20poly1305` only to read the UI cache key and open its UI state
-file.
+file. For each release target (Linux, Windows and macOS on x86_64 and aarch64), `cargo xtask layers`
+resolves the GUI on its own (`cargo tree -p` with all its features, without dev-dependencies), as
+its release build does, and fails when it links a crate on this list, or `craft-chat` with its `http`
+feature. The list is `MUST_NOT_LINK` in `xtask/src/layers.rs`. The check is skipped while no
+workspace member has its manifest in `apps/shellcraft/`.
 
 ### `craft-<name>` crates
 
@@ -121,8 +133,23 @@ storytold/craft-libs with one `Cargo.toml` change.
 - Every parser it holds is in its hostile-input sweep, built on `craft-testkit`, and has a fuzz
   target.
 
-`shellcraft-*` crates inherit `version`, `edition`, `rust-version`, `license` and `repository` from
-`[workspace.package]`.
+`shellcraft-*` crates, the apps and `xtask` inherit `version`, `edition`, `rust-version`, `license`
+and `repository` from `[workspace.package]`.
+
+`cargo xtask layers` checks these rules for each `craft-<name>` crate:
+
+- Its manifest fields, with a `version` of 0.1.0 or later and the `edition` and `rust-version` of
+  craft-libs at the pinned rev (`CRAFT_LIBS_EDITION` and `CRAFT_LIBS_RUST_VERSION` in
+  `xtask/src/layers.rs`, which the pull request that moves the pin updates).
+- Its own `README.md`, and no target source or `readme` outside its folder. Files that its sources
+  name with `#[path]` or `include!` are not checked.
+- No dependency on a `shellcraft` crate, directly or through other crates, dev- and
+  build-dependencies included.
+- In the files of the crate that Git tracks or would add: no symbolic link or Git submodule, and no
+  use of the word ShellCraft in a file or folder name or in a `.rs`, `.md` or `.toml` file.
+
+It also checks that every other crate inherits its fields from `[workspace.package]`. It does not
+check `unsafe`, the hostile-input sweep or the fuzz targets.
 
 craft-libs crates are git dependencies, all pinned to one `rev` in the root `Cargo.toml`. No
 craft-libs source is copied into this repository.
@@ -180,6 +207,7 @@ failure:
 | `fmt` | `cargo fmt --all -- --check` |
 | `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | `test` | the workspace tests, then the tests of the `xtask` package |
+| `layers` | the crate layers, the GUI's must-not-link list and the manifest rules (see Layers and `craft-<name>` crates) |
 | `wasm` | the crates that build for the web compile for `wasm32-unknown-unknown` |
 
 `ci` leaves the `wasm` step out while no crate builds for the web, and says so; `cargo xtask wasm`
