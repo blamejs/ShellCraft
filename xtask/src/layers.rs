@@ -3,17 +3,23 @@
 //!
 //! - Every workspace member has a row in the crate table of AGENTS.md › Layers, and depends only on
 //!   members in its own layer or a lower one. No crate in a layer depends on a tooling crate.
-//! - Only L6 crates depend on the UI crates (`egui`, `eframe`, `winit`, `rfd` and the `egui_` and
-//!   `egui-` crates), directly or through packages outside the workspace.
-//! - Each app in [`MUST_NOT_LINK`] links none of the crates listed for it when it is built on its
-//!   own with every feature on, for each of [`RELEASE_TARGETS`].
+//! - Only L6 crates depend on the UI crates (`egui`, `eframe`, `winit`, `rfd`, the `egui_` and
+//!   `egui-` crates, `craft-ui`, the `craft-ui-*` crates and the `craft-*-ui` crates) or on the
+//!   `craft` facade with a UI feature on, directly or through packages outside the workspace.
+//! - Each app in [`MUST_NOT_LINK`] links none of the crates and features listed for it when it is
+//!   built on its own, for each of [`RELEASE_TARGETS`], or for `wasm32-unknown-unknown` for a web
+//!   app.
+//! - A crate in the `cargo xtask wasm` list turns on the facade's [`NATIVE_ONLY_FEATURES`] only in
+//!   a native `[target]` entry.
 //! - A `craft-<name>` crate sets its own package fields, with the craft-libs edition and minimum
-//!   Rust version, has its own `README.md`, depends on no `shellcraft` crate and does not use the
-//!   word ShellCraft. Every other member inherits its package fields from `[workspace.package]`.
+//!   Rust version, has its own `README.md`, depends on no `shellcraft` crate and not on the `craft`
+//!   facade, and does not use the word ShellCraft. Every other member inherits its package fields
+//!   from `[workspace.package]`.
 //!
 //! Direct dependencies come from `cargo metadata --all-features`, dev- and build-dependencies
-//! included. Paths through other packages come from `cargo tree -p` for each member on its own, as
-//! Cargo resolves its features when that member alone is built.
+//! included. Paths through other packages and the features they are built with come from
+//! `cargo tree -p` for each member on its own, as Cargo resolves its features when that member
+//! alone is built.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -56,8 +62,16 @@ const TABLE_HEADER: &str = "| Crate | Layer |";
 /// The layer cell of a tooling crate.
 const TOOLING: &str = "tooling, outside the layers";
 
-/// The UI crates by exact name. Names that start with `egui_` or `egui-` are UI crates too.
-const UI_CRATES: &[&str] = &["egui", "eframe", "winit", "rfd"];
+/// The UI crates by exact name. Names that start with `egui_`, `egui-` or `craft-ui-`, and the
+/// `craft-<name>-ui` crates, are UI crates too.
+const UI_CRATES: &[&str] = &["egui", "eframe", "winit", "rfd", "craft-ui"];
+
+/// The package name of the Craft framework facade, which has one feature per craft-libs crate.
+pub const FACADE: &str = "craft";
+
+/// The facade features that do not build for `wasm32-unknown-unknown` (marked "native only" in the
+/// facade's `Cargo.toml`).
+pub const NATIVE_ONLY_FEATURES: &[&str] = &["update", "dialogs", "font-subset"];
 
 /// The package fields a `craft-<name>` crate sets itself, as plain strings.
 const CRAFT_OWN_FIELDS: &[&str] = &["version", "license", "edition", "rust-version"];
@@ -93,37 +107,146 @@ const INHERITED_FIELDS: &[&str] = &["version", "edition", "rust-version", "licen
 /// reads. It checks the names of all files and folders.
 const SCANNED_EXTENSIONS: &[&str] = &["rs", "md", "toml"];
 
-/// A crate an app must not link, or one feature of it.
+/// What an app must not link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Banned {
-    pub krate: &'static str,
-    /// `None` bans the crate; `Some(feature)` bans only that feature of it.
-    pub feature: Option<&'static str>,
+pub enum Banned {
+    /// The crate.
+    Crate(&'static str),
+    /// One feature of the crate.
+    Feature(&'static str, &'static str),
+    /// Every UI crate, and the `craft` facade with a UI feature on.
+    Ui,
+    /// Every `shellcraft` crate but the ones listed.
+    ShellcraftCrates { except: &'static [&'static str] },
 }
 
-const fn krate(krate: &'static str) -> Banned {
-    Banned { krate, feature: None }
+use Banned::{Crate, Feature, ShellcraftCrates, Ui};
+
+/// The static Linux builds of the remote agent.
+pub const MUSL_TARGETS: &[&str] = &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
+
+/// The targets an app is built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Targets {
+    /// [`RELEASE_TARGETS`].
+    Release,
+    /// [`RELEASE_TARGETS`] and [`MUSL_TARGETS`].
+    ReleaseAndMusl,
+    /// `wasm32-unknown-unknown`.
+    Web,
 }
 
-/// The apps, by the folder of their manifest relative to the workspace root, and the crates they
-/// must not link (AGENTS.md › Layers). An app whose folder holds no workspace member is skipped.
-pub const MUST_NOT_LINK: &[(&str, &[Banned])] = &[(
-    // The GUI.
-    "apps/shellcraft",
-    &[
-        krate("tokio"),
-        krate("russh"),
-        krate("tokio-postgres"),
-        krate("rusqlite"),
-        krate("craft-vault"),
-        krate("craft-keywrap"),
-        krate("craft-scrub"),
-        krate("craft-term-grid"),
-        krate("craft-oauth"),
-        Banned { krate: "craft-chat", feature: Some("http") },
-        krate("craft-chat-store"),
-    ],
-)];
+impl Targets {
+    fn contains(self, target: &str) -> bool {
+        match self {
+            Targets::Release => RELEASE_TARGETS.contains(&target),
+            Targets::ReleaseAndMusl => RELEASE_TARGETS.contains(&target) || MUSL_TARGETS.contains(&target),
+            Targets::Web => target == wasm::TARGET,
+        }
+    }
+}
+
+use Targets::{Release, ReleaseAndMusl, Web};
+
+/// An app, by the folder of its manifest relative to the workspace root, and what it must not link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct App {
+    pub dir: &'static str,
+    pub targets: Targets,
+    pub banned: &'static [Banned],
+    /// What the release build, with the app's default features only, must not link either.
+    pub release_banned: &'static [Banned],
+}
+
+/// The release ban of the GUI and the web app: the facade's `automation` is for development builds.
+const DEVELOPMENT_ONLY: &[Banned] = &[Feature(FACADE, "automation")];
+
+/// The apps and what they must not link (AGENTS.md › Layers). An app whose folder holds no
+/// workspace member is skipped.
+pub const MUST_NOT_LINK: &[App] = &[
+    App {
+        dir: "apps/shellcraft",
+        targets: Release,
+        banned: &[
+            Crate("tokio"),
+            Crate("russh"),
+            Crate("tokio-postgres"),
+            Crate("rusqlite"),
+            Crate("craft-vault"),
+            Crate("craft-keywrap"),
+            Crate("craft-scrub"),
+            Crate("craft-term-grid"),
+            Crate("craft-oauth"),
+            Feature("craft-chat", "http"),
+            Crate("craft-chat-store"),
+            Feature(FACADE, "update"),
+            Feature(FACADE, "mcp-server"),
+            Feature(FACADE, "control-agents"),
+            Feature(FACADE, "automation-agents"),
+        ],
+        release_banned: DEVELOPMENT_ONLY,
+    },
+    App { dir: "apps/shellcraftd", targets: Release, banned: &[Ui], release_banned: &[] },
+    App {
+        dir: "apps/shellcraft-host",
+        targets: Release,
+        banned: &[Crate("russh"), Crate("tokio-postgres"), Crate("rusqlite"), Crate("tokio"), Crate("craft-vault"), Ui],
+        release_banned: &[],
+    },
+    App { dir: "apps/shellcraft-cli", targets: Release, banned: &[Ui], release_banned: &[] },
+    App {
+        dir: "apps/shellcraft-agent",
+        targets: ReleaseAndMusl,
+        banned: &[Crate("craft-keystore"), Crate("craft-vault"), Crate("tokio-postgres"), Ui],
+        release_banned: &[],
+    },
+    App {
+        dir: "apps/shellcraft-web",
+        targets: Web,
+        banned: &[
+            Crate("tokio"),
+            Crate("rusqlite"),
+            Crate("craft-ipc"),
+            Crate("craft-keystore"),
+            Crate("craft-vault"),
+            Crate("craft-keywrap"),
+            Crate("craft-scrub"),
+            Crate("craft-oauth"),
+            Feature("craft-chat", "http"),
+            Crate("craft-chat-store"),
+            Crate("craft-web-api"),
+            Crate("craft-web-host"),
+            Feature(FACADE, "update"),
+            Feature(FACADE, "dialogs"),
+            Feature(FACADE, "font-subset"),
+            Feature(FACADE, "mcp-server"),
+            Feature(FACADE, "control-agents"),
+            Feature(FACADE, "automation-agents"),
+        ],
+        release_banned: DEVELOPMENT_ONLY,
+    },
+    App {
+        dir: "apps/shellcraft-webgate",
+        targets: Release,
+        banned: &[
+            Crate("craft-vault"),
+            Crate("craft-keystore"),
+            Crate("craft-keywrap"),
+            Crate("craft-scrub"),
+            Crate("craft-oauth"),
+            Crate("craft-chat"),
+            ShellcraftCrates { except: &["shellcraft-proto"] },
+        ],
+        release_banned: &[],
+    },
+    App {
+        dir: "apps/shellcraft-vault-worker",
+        targets: Web,
+        // `craft-vault` holds the vault's crypto.
+        banned: &[ShellcraftCrates { except: &[] }, Crate("craft-vault"), Crate("craft-keywrap"), Crate("craft-keystore"), Crate("tokio")],
+        release_banned: &[],
+    },
+];
 
 /// Where a crate sits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +310,8 @@ pub struct Package {
     pub files_outside: Vec<String>,
     /// The source files of its targets and its `readme` file, as `cargo metadata` gives them.
     pub sources: Vec<String>,
+    /// The names of the features its manifest declares.
+    pub features: Vec<String>,
 }
 
 /// What the ShellCraft-word scan found in a `craft-<name>` crate.
@@ -352,9 +477,13 @@ pub fn packages(metadata: &[u8]) -> Result<Vec<Package>, String> {
             let package = graph.package(id)?;
             let crate_dir = Path::new(&manifest_path).parent().unwrap_or(Path::new(""));
             let targets = array_field(package, "targets").into_iter().flatten().filter_map(|t| str_field(t, "src_path"));
-            let sources: Vec<String> = targets.chain(str_field(package, "readme")).map(str::to_owned).collect();
+            let sources: Vec<String> =
+                targets.chain(str_field(package, "readme")).chain(str_field(package, "license_file")).map(str::to_owned).collect();
             let files_outside = sources.iter().filter(|path| !stays_inside(crate_dir, Path::new(path))).cloned().collect();
-            Ok(Package { name, id: (*id).to_owned(), manifest_path, dir, deps, sources, files_outside })
+            let mut features: Vec<String> =
+                package.get("features").and_then(serde_json::Value::as_object).map_or_else(Vec::new, |f| f.keys().cloned().collect());
+            features.sort();
+            Ok(Package { name, id: (*id).to_owned(), manifest_path, dir, deps, sources, files_outside, features })
         })
         .collect()
 }
@@ -485,7 +614,9 @@ pub struct Reach {
     pub from: String,
     /// Its direct dependency.
     pub via: String,
-    /// The first UI crate reached below `via`.
+    /// A UI feature that `via`, the `craft` facade, is built with.
+    pub via_ui_feature: Option<String>,
+    /// The first UI package reached below `via`, as [`ui_of`] describes it.
     pub ui: Option<String>,
     /// The members reached below `via`.
     pub members: Vec<String>,
@@ -509,7 +640,13 @@ pub fn reaches(tree: &str, members: &[Member]) -> Result<Vec<Reach>, String> {
     for &root in &tree.roots {
         let Some(from) = member_of(root) else { continue };
         for &(start, _) in tree.children(root) {
-            let mut reach = Reach { from: from.name.clone(), via: node_name(start.label).to_owned(), ui: None, members: Vec::new() };
+            let mut reach = Reach {
+                from: from.name.clone(),
+                via: node_name(start.label).to_owned(),
+                via_ui_feature: facade_ui_feature(start.label).map(str::to_owned),
+                ui: None,
+                members: Vec::new(),
+            };
             let mut seen = BTreeSet::from([start]);
             let mut queue = std::collections::VecDeque::from([start]);
             while let Some(node) = queue.pop_front() {
@@ -517,9 +654,8 @@ pub fn reaches(tree: &str, members: &[Member]) -> Result<Vec<Reach>, String> {
                     if !seen.insert(child) {
                         continue;
                     }
-                    let name = node_name(child.label);
-                    if reach.ui.is_none() && is_ui_crate(name) {
-                        reach.ui = Some(name.to_owned());
+                    if reach.ui.is_none() {
+                        reach.ui = ui_of(child.label);
                     }
                     if let Some(m) = member_of(child)
                         && !reach.members.contains(&m.name)
@@ -529,7 +665,7 @@ pub fn reaches(tree: &str, members: &[Member]) -> Result<Vec<Reach>, String> {
                     queue.push_back(child);
                 }
             }
-            if (reach.ui.is_some() || !reach.members.is_empty()) && !out.contains(&reach) {
+            if (reach.via_ui_feature.is_some() || reach.ui.is_some() || !reach.members.is_empty()) && !out.contains(&reach) {
                 out.push(reach);
             }
         }
@@ -578,17 +714,53 @@ pub fn check_craft_paths(tree: &str, members: &[Member]) -> Vec<String> {
 
 /// Every package the root `app` (a package name) links in the output of [`package_tree`], with the
 /// features it is built with: its normal dependencies built for the target, followed through every
-/// package. `None` when `app` is not a root of the output.
+/// package. The root itself is not in the list; another package with its name is. `None` when
+/// `app` is not a root of the output.
 pub fn linked(tree: &str, app: &str) -> Option<BTreeMap<String, BTreeSet<String>>> {
+    linked_with(tree, app, false)
+}
+
+/// [`linked`] for the test build of `app`: its own dev-dependencies built for the target are
+/// followed too.
+pub fn linked_in_tests(tree: &str, app: &str) -> Option<BTreeMap<String, BTreeSet<String>>> {
+    linked_with(tree, app, true)
+}
+
+fn linked_with(tree: &str, app: &str, root_dev: bool) -> Option<BTreeMap<String, BTreeSet<String>>> {
     let tree = Tree::parse(tree);
-    let root = *tree.roots.iter().find(|r| node_name(r.label) == app)?;
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for node in linked_nodes(&tree, app, root_dev)? {
+        out.entry(node_name(node.label).to_owned()).or_default().extend(node_features(node.label).map(str::to_owned));
+    }
+    Some(out)
+}
+
+/// The workspace members among the packages the root `app` links in the output of
+/// [`package_tree`], matched by their folders, with `app` itself. `None` when `app` is not a root of
+/// the output.
+fn linked_members(tree: &str, app: &str, members: &[Member]) -> Option<BTreeSet<String>> {
+    let tree = Tree::parse(tree);
+    let mut out = BTreeSet::from([app.to_owned()]);
+    for node in linked_nodes(&tree, app, false)? {
+        out.extend(members.iter().filter(|m| m.is(node.label)).map(|m| m.name.clone()));
+    }
+    Some(out)
+}
+
+/// The nodes the root `app` links in `tree`, without the root; with `root_dev`, through its own
+/// dev-dependencies too.
+fn linked_nodes<'t>(tree: &Tree<'t>, app: &str, root_dev: bool) -> Option<Vec<Node<'t>>> {
+    let root = *tree.roots.iter().find(|r| node_name(r.label) == app)?;
+    let mut out = Vec::new();
     let mut seen = BTreeSet::from([root]);
     let mut queue = std::collections::VecDeque::from([root]);
     while let Some(node) = queue.pop_front() {
-        out.entry(node_name(node.label).to_owned()).or_default().extend(node_features(node.label).map(str::to_owned));
+        if node != root {
+            out.push(node);
+        }
         for &(child, kind) in tree.children(node) {
-            if kind == Kind::Normal && !child.host && seen.insert(child) {
+            let followed = kind == Kind::Normal || (root_dev && kind == Kind::Dev && node == root);
+            if followed && !child.host && seen.insert(child) {
                 queue.push_back(child);
             }
         }
@@ -596,15 +768,54 @@ pub fn linked(tree: &str, app: &str) -> Option<BTreeMap<String, BTreeSet<String>
     Some(out)
 }
 
-/// `cargo tree -p <id>` for the package `name` with Cargo package ID `id`, with every feature of it
-/// on, for `target`, following `edges` (`normal,build,dev` or `normal,no-proc-macro`), in the form
-/// [`Tree`] reads. Cargo resolves the features as a build of that package alone does, without the
-/// features other members turn on. Without dev-dependencies, the features only they turn on are
-/// left out too, as in a release build.
-fn package_tree(root: &Path, name: &str, id: &str, target: &str, edges: &str) -> Result<String, String> {
-    let label = format!("cargo tree --package {name} --target {target} --edges {edges}");
+/// The features [`package_tree`] turns on in the package it resolves.
+#[derive(Debug, Clone, Copy)]
+enum Features<'a> {
+    /// Every feature.
+    All,
+    /// The default features and these.
+    Listed(&'a [String]),
+}
+
+/// The features an app, or a crate in the `cargo xtask wasm` list, is checked with: every feature
+/// its manifest declares but the test-only ones, whose names end in `testing` (as the facade's
+/// `screen-testing` and `ui-testing`). Test builds are not shipped, so the rules do not apply to
+/// them.
+fn app_features(app: &Package) -> Vec<String> {
+    app.features.iter().filter(|f| !f.ends_with("testing")).cloned().collect()
+}
+
+/// `cargo tree -p <id>` for the package `name` with Cargo package ID `id`, with `features` on, for
+/// `target`, following `edges` (`normal,build,dev`, `normal,build` or `normal,dev`), in the form
+/// [`Tree`] reads.
+/// Cargo resolves the features as a build of that package alone does, without the features other
+/// members turn on. Without dev-dependencies, the features only they turn on are left out too, as
+/// in a release build.
+fn package_tree(root: &Path, name: &str, id: &str, features: Features<'_>, target: &str, edges: &str) -> Result<String, String> {
+    selection_tree(root, &[(name, id)], features, target, edges)
+}
+
+/// [`package_tree`] for several packages, `(name, id)`, selected in one command, as
+/// `cargo check -p <a> -p <b>` builds them: Cargo resolves their features together. With more than
+/// one package, `features` is [`Features::Listed`] with no feature.
+fn selection_tree(root: &Path, selection: &[(&str, &str)], features: Features<'_>, target: &str, edges: &str) -> Result<String, String> {
+    let names: Vec<&str> = selection.iter().map(|(name, _)| *name).collect();
+    let label = format!("cargo tree --package {} --target {target} --edges {edges}", names.join(" --package "));
     let mut c = runner::cargo(root);
-    c.args(["tree", "--locked", "--package", id, "--all-features", "--edges", edges, "--target", target]);
+    c.args(["tree", "--locked"]);
+    for (_, id) in selection {
+        c.args(["--package", id]);
+    }
+    c.args(["--edges", edges, "--target", target]);
+    match features {
+        Features::All => {
+            c.arg("--all-features");
+        }
+        Features::Listed([]) => {}
+        Features::Listed(list) => {
+            c.args(["--features", &list.join(",")]);
+        }
+    }
     c.args(["--prefix", "indent", "--charset", "utf8", "--format", "{p}|{f}|", "--color", "never"]);
     let out = c.output().map_err(|e| format!("{label}: failed to spawn: {e}"))?;
     if !out.status.success() {
@@ -653,15 +864,45 @@ fn below_ui_layer(layer: Layer) -> bool {
 }
 
 fn is_ui_crate(name: &str) -> bool {
-    UI_CRATES.contains(&name) || name.starts_with("egui_") || name.starts_with("egui-")
+    UI_CRATES.contains(&name)
+        || name.starts_with("egui_")
+        || name.starts_with("egui-")
+        || name.starts_with("craft-ui-")
+        || (is_craft_crate(name) && name.ends_with("-ui"))
+}
+
+/// A UI feature of the `craft` facade: `ui` and the `ui-*` features, the `<name>-ui` features of
+/// the `craft-<name>-ui` crates and their `<name>-ui-*` features, and the `*-egui` features.
+fn is_ui_feature(feature: &str) -> bool {
+    feature == "ui" || feature.starts_with("ui-") || feature.ends_with("-ui") || feature.contains("-ui-") || feature.ends_with("-egui")
+}
+
+/// The first UI feature that the [`Tree`] node `label` of the `craft` facade is built with.
+fn facade_ui_feature(label: &str) -> Option<&str> {
+    if node_name(label) != FACADE {
+        return None;
+    }
+    node_features(label).find(|f| is_ui_feature(f))
+}
+
+/// What makes the [`Tree`] node `label` a UI package: it is a UI crate, or the `craft` facade with a
+/// UI feature on.
+fn ui_of(label: &str) -> Option<String> {
+    let name = node_name(label);
+    if is_ui_crate(name) {
+        return Some(format!("the UI crate `{name}`"));
+    }
+    facade_ui_feature(label).map(|f| format!("`{FACADE}` with its UI feature `{f}`"))
 }
 
 fn is_craft_crate(name: &str) -> bool {
     name.starts_with("craft-")
 }
 
+/// A `shellcraft` package: any name that starts with the word, such as `shellcraft-proto`,
+/// `shellcraft_store` or `shellcraftd`.
 fn is_shellcraft_crate(name: &str) -> bool {
-    name == "shellcraft" || name.starts_with("shellcraft-")
+    name.starts_with("shellcraft")
 }
 
 /// The layer rules: every member has a row, depends on members in its own layer or a lower one and
@@ -707,10 +948,14 @@ pub fn check_reach(table: &BTreeMap<String, Layer>, reaches: &[Reach]) -> Vec<St
                 _ => {}
             }
         }
-        if let Some(ui) = &r.ui
-            && below_ui_layer(from)
-        {
-            problems.push(format!("{via} the UI crate `{ui}`; only L{UI_LAYER} crates may"));
+        if !below_ui_layer(from) {
+            continue;
+        }
+        if let Some(feature) = &r.via_ui_feature {
+            problems.push(format!("`{}` ({from}) depends on `{}` with its UI feature `{feature}`; only L{UI_LAYER} crates may", r.from, r.via));
+        }
+        if let Some(ui) = &r.ui {
+            problems.push(format!("{via} {ui}; only L{UI_LAYER} crates may"));
         }
     }
     problems
@@ -719,6 +964,29 @@ pub fn check_reach(table: &BTreeMap<String, Layer>, reaches: &[Reach]) -> Vec<St
 /// The `[package]` table of a member's manifest.
 fn package_table<'d>(name: &str, doc: &'d Document<&str>) -> Result<&'d Item, String> {
     doc.get("package").filter(|p| p.is_table_like()).ok_or_else(|| format!("`{name}`: Cargo.toml has no [package] table"))
+}
+
+/// The `path` values of the `[lib]`, `[[bin]]`, `[[example]]`, `[[test]]` and `[[bench]]` tables
+/// in `manifest`, inline tables included, and its `[package]` `build`, `readme` and `license-file`
+/// paths. An unreadable manifest has none.
+fn declared_target_paths(manifest: &str) -> Vec<String> {
+    let Ok(doc) = Document::parse(manifest) else { return Vec::new() };
+    let path = |t: &dyn toml_edit::TableLike| t.get("path").and_then(Item::as_str).map(str::to_owned);
+    let mut paths: Vec<String> = doc.get("lib").and_then(Item::as_table_like).and_then(path).into_iter().collect();
+    // The build script, `build = "<path>"` in `[package]`, and the `readme` and `license-file` there.
+    for field in ["build", "readme", "license-file"] {
+        paths.extend(doc.get("package").and_then(|p| p.get(field)).and_then(Item::as_str).map(str::to_owned));
+    }
+    for kind in ["bin", "example", "test", "bench"] {
+        match doc.get(kind) {
+            Some(Item::ArrayOfTables(tables)) => paths.extend(tables.iter().filter_map(|t| path(t))),
+            Some(Item::Value(toml_edit::Value::Array(items))) => {
+                paths.extend(items.iter().filter_map(toml_edit::Value::as_inline_table).filter_map(|t| path(t)));
+            }
+            _ => {}
+        }
+    }
+    paths
 }
 
 /// The manifest rules of a `craft-<name>` crate.
@@ -767,12 +1035,24 @@ pub fn check_craft_crate(p: &Package, manifest: &str, has_readme: bool, files: &
         },
         Err(e) => problems.push(format!("`{name}`: Cargo.toml is not valid TOML: {e}")),
     }
+    // Cargo reports target paths with `..` resolved, so the declared ones are read here.
+    for path in declared_target_paths(manifest) {
+        if Path::new(&path).components().any(|c| c == Component::ParentDir) {
+            problems.push(format!("`{name}` declares the path {path}, which has a `..`; a craft crate names its files without one"));
+        }
+        if Path::new(&path).has_root() {
+            problems.push(format!("`{name}` declares the path {path}, which is absolute; a craft crate names its files relative to its folder"));
+        }
+    }
     if !has_readme {
         problems.push(format!("`{name}` has no README.md of its own"));
     }
     for d in &p.deps {
         if is_shellcraft_crate(&d.name) {
             problems.push(format!("`{name}` depends on `{}`{}; a craft crate depends on no shellcraft crate", d.name, d.kind.suffix()));
+        }
+        if d.name == FACADE {
+            problems.push(format!("`{name}` depends on the `{FACADE}` facade{}; a craft crate depends on single craft-libs crates", d.kind.suffix()));
         }
     }
     // The crate's own folder moves with it; the folders above it do not.
@@ -781,8 +1061,9 @@ pub fn check_craft_crate(p: &Package, manifest: &str, has_readme: bool, files: &
     {
         problems.push(format!("`{name}`: its folder {folder} uses the word ShellCraft"));
     }
+    // Each folder is listed on its own, so only the last name of a path is checked.
     for path in &files.names {
-        if path.to_ascii_lowercase().contains("shellcraft") {
+        if path.rsplit('/').next().is_some_and(|last| last.to_ascii_lowercase().contains("shellcraft")) {
             problems.push(format!("`{name}`: the name {path} uses the word ShellCraft"));
         }
     }
@@ -837,17 +1118,229 @@ pub fn check_inherited(p: &Package, manifest: &str) -> Vec<String> {
 
 /// The banned crates and features that the app `app` (a package name) links, from [`linked`].
 pub fn check_links(app: &str, banned: &[Banned], linked: &BTreeMap<String, BTreeSet<String>>) -> Vec<String> {
-    banned
-        .iter()
-        .filter_map(|b| {
-            let features = linked.get(b.krate)?;
-            match b.feature {
-                None => Some(format!("`{app}` links `{}`, which it must not link", b.krate)),
-                Some(f) if features.contains(f) => Some(format!("`{app}` links `{}` with its `{f}` feature, which it must not link", b.krate)),
-                Some(_) => None,
+    let mut problems = Vec::new();
+    for b in banned {
+        match *b {
+            Crate(krate) => {
+                if linked.contains_key(krate) {
+                    problems.push(format!("`{app}` links `{krate}`, which it must not link"));
+                }
             }
-        })
+            Feature(krate, feature) => {
+                if linked.get(krate).is_some_and(|features| features.contains(feature)) {
+                    problems.push(format!("`{app}` links `{krate}` with its `{feature}` feature, which it must not link"));
+                }
+            }
+            Ui => {
+                for (name, features) in linked {
+                    if is_ui_crate(name) {
+                        problems.push(format!("`{app}` links the UI crate `{name}`, which it must not link"));
+                    }
+                    if name == FACADE {
+                        for feature in features.iter().filter(|f| is_ui_feature(f)) {
+                            problems.push(format!("`{app}` links `{FACADE}` with its UI feature `{feature}`, which it must not link"));
+                        }
+                    }
+                }
+            }
+            ShellcraftCrates { except } => {
+                for name in linked.keys().filter(|name| is_shellcraft_crate(name) && !except.contains(&name.as_str())) {
+                    problems.push(format!("`{app}` links `{name}`, which it must not link"));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// The facade's [`NATIVE_ONLY_FEATURES`] that the web build of the crate `name` turns on, from
+/// [`linked`] for `wasm32-unknown-unknown`, which holds the features other features turn on too.
+pub fn check_web_features(name: &str, linked: &BTreeMap<String, BTreeSet<String>>) -> Vec<String> {
+    linked
+        .get(FACADE)
+        .into_iter()
+        .flatten()
+        .filter(|f| NATIVE_ONLY_FEATURES.contains(&f.as_str()))
+        .map(|f| format!("`{name}` is built for {} with the native-only `{FACADE}` feature `{f}`", wasm::TARGET))
         .collect()
+}
+
+/// The `cfg` values of `wasm32-unknown-unknown` that [`is_native_target`] knows. A `name = "value"`
+/// predicate on one of these names is true only for the value listed.
+const WASM_CFG: &[(&str, &str)] = &[
+    ("target_arch", "wasm32"),
+    ("target_family", "wasm"),
+    ("target_os", "unknown"),
+    ("target_env", ""),
+    ("target_vendor", "unknown"),
+    ("target_pointer_width", "32"),
+    ("target_endian", "little"),
+];
+
+/// The bare `cfg` names that are false for `wasm32-unknown-unknown`.
+const WASM_FALSE_NAMES: &[&str] = &["unix", "windows"];
+
+/// Whether the key of a `[target.<key>]` table never selects `wasm32-unknown-unknown`: a target
+/// triple other than that one, or a `cfg(...)` expression that is false for it. The expression is
+/// evaluated with `any`, `all` and `not` over `true`, `false` and the values in [`WASM_CFG`] and
+/// [`WASM_FALSE_NAMES`];
+/// a predicate on anything else may be true, so an expression that depends on one counts as one
+/// that may select the web target.
+fn is_native_target(key: &str) -> bool {
+    let key = key.trim();
+    match key.strip_prefix("cfg(").and_then(|c| c.strip_suffix(')')) {
+        Some(expr) => CfgParser { rest: expr }.expression_to_end() == Some(Some(false)),
+        None => key != wasm::TARGET,
+    }
+}
+
+/// A parser and evaluator of a `cfg` expression for `wasm32-unknown-unknown`. Each value is
+/// `Some(bool)` when it is known and `None` when it may be either; a malformed expression is
+/// `None` at the top.
+struct CfgParser<'a> {
+    rest: &'a str,
+}
+
+impl CfgParser<'_> {
+    fn expression_to_end(mut self) -> Option<Option<bool>> {
+        let value = self.expression()?;
+        self.rest.trim().is_empty().then_some(value)
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        let trimmed = self.rest.trim_start();
+        match trimmed.strip_prefix(token) {
+            Some(after) => {
+                self.rest = after;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A name, with a raw identifier's `r#` taken off.
+    fn ident(&mut self) -> Option<&str> {
+        let trimmed = self.rest.trim_start();
+        let trimmed = trimmed.strip_prefix("r#").unwrap_or(trimmed);
+        let end = trimmed.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(trimmed.len());
+        if end == 0 {
+            return None;
+        }
+        let (ident, after) = trimmed.split_at(end);
+        self.rest = after;
+        Some(ident)
+    }
+
+    fn expression(&mut self) -> Option<Option<bool>> {
+        // A raw identifier such as `r#true` is a name, never a literal or an operator.
+        let raw = self.rest.trim_start().starts_with("r#");
+        let name = self.ident()?.to_owned();
+        match name.as_str() {
+            "any" | "all" | "not" if !raw => {
+                if !self.eat("(") {
+                    return None;
+                }
+                let mut values = Vec::new();
+                while !self.eat(")") {
+                    values.push(self.expression()?);
+                    if !self.eat(",") && !self.rest.trim_start().starts_with(')') {
+                        return None;
+                    }
+                }
+                match name.as_str() {
+                    "not" => match values.as_slice() {
+                        [value] => Some(value.map(|v| !v)),
+                        _ => None,
+                    },
+                    "any" if values.contains(&Some(true)) => Some(Some(true)),
+                    "any" if values.iter().all(|v| *v == Some(false)) => Some(Some(false)),
+                    "all" if values.contains(&Some(false)) => Some(Some(false)),
+                    "all" if values.iter().all(|v| *v == Some(true)) => Some(Some(true)),
+                    _ => Some(None),
+                }
+            }
+            _ if self.eat("=") => {
+                let trimmed = self.rest.trim_start().strip_prefix('"')?;
+                let end = trimmed.find('"')?;
+                let value = &trimmed[..end];
+                self.rest = &trimmed[end + 1..];
+                Some(WASM_CFG.iter().find(|(n, _)| *n == name).map(|(_, wasm)| *wasm == value))
+            }
+            "true" if !raw => Some(Some(true)),
+            "false" if !raw => Some(Some(false)),
+            "true" | "false" => Some(None),
+            _ => Some(WASM_FALSE_NAMES.contains(&name.as_str()).then_some(false)),
+        }
+    }
+}
+
+/// The rule for a crate in the `cargo xtask wasm` list: it turns on none of the facade's
+/// [`NATIVE_ONLY_FEATURES`] in an entry for the facade that the web build uses, that is one in
+/// `[dependencies]` or under a `[target]` key that is not [`is_native_target`], directly, through
+/// `[workspace.dependencies]` (`workspace_dependencies`, the root manifest's table) or through
+/// a feature of its own (`<dependency>/<feature>`).
+pub fn check_wasm_features(name: &str, manifest: &str, workspace_dependencies: Option<&Item>) -> Vec<String> {
+    let doc = match Document::parse(manifest) {
+        Ok(doc) => doc,
+        Err(e) => return vec![format!("`{name}`: Cargo.toml is not valid TOML: {e}")],
+    };
+    // Each dependency table, and whether the web build can use it. Build-dependencies build for the
+    // machine that runs the build, never for the web target, so they are not read.
+    const KINDS: &[&str] = &["dependencies", "dev-dependencies"];
+    let mut tables: Vec<(String, &Item, bool)> = Vec::new();
+    for kind in KINDS {
+        if let Some(deps) = doc.get(kind) {
+            tables.push((format!("[{kind}]"), deps, true));
+        }
+    }
+    for (key, target) in doc.get("target").and_then(Item::as_table_like).into_iter().flat_map(|t| t.iter()) {
+        for kind in KINDS {
+            if let Some(deps) = target.get(kind) {
+                tables.push((format!("[target.'{key}'.{kind}]"), deps, !is_native_target(key)));
+            }
+        }
+    }
+    let mut problems = Vec::new();
+    // Every name the facade goes by, in any table: a feature of the crate that turns on a
+    // native-only feature of it is reported wherever the entry is.
+    let mut facade_keys = BTreeSet::new();
+    for (table, deps, web) in tables {
+        for (key, entry) in deps.as_table_like().into_iter().flat_map(|t| t.iter()) {
+            let inherited = entry.get("workspace").and_then(Item::as_bool) == Some(true);
+            let from_workspace = workspace_dependencies.filter(|_| inherited).and_then(|w| w.get(key));
+            let package = entry.get("package").or_else(|| from_workspace.and_then(|w| w.get("package"))).and_then(Item::as_str).unwrap_or(key);
+            if package != FACADE {
+                continue;
+            }
+            facade_keys.insert(key.to_owned());
+            // The shared `[workspace.dependencies]` entry counts wherever the crate inherits it.
+            let workspace_place = format!("[workspace.dependencies] for {table}");
+            let places = [(web.then_some(entry), table.as_str()), (from_workspace, workspace_place.as_str())];
+            for (item, place) in places.into_iter().filter_map(|(item, place)| item.map(|i| (i, place))) {
+                for feature in item.get("features").and_then(Item::as_array).into_iter().flat_map(|a| a.iter()).filter_map(|v| v.as_str()) {
+                    if NATIVE_ONLY_FEATURES.contains(&feature) {
+                        problems.push(format!(
+                            "`{name}` turns on the native-only `{FACADE}` feature `{feature}` in {place}; a crate checked for {} turns it on only in a native [target] entry",
+                            wasm::TARGET
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for (own, values) in doc.get("features").and_then(Item::as_table_like).into_iter().flat_map(|t| t.iter()) {
+        for value in values.as_array().into_iter().flat_map(|a| a.iter()).filter_map(|v| v.as_str()) {
+            let Some((dep, feature)) = value.split_once('/') else { continue };
+            let dep = dep.strip_suffix('?').unwrap_or(dep);
+            if facade_keys.contains(dep) && NATIVE_ONLY_FEATURES.contains(&feature) {
+                problems.push(format!(
+                    "`{name}`'s feature `{own}` turns on the native-only `{FACADE}` feature `{feature}` through `{value}`; a crate checked for {} turns it on only in a native [target] entry",
+                    wasm::TARGET
+                ));
+            }
+        }
+    }
+    problems
 }
 
 /// A file of a crate as Git lists it: its path relative to the crate, with `/` between components,
@@ -923,7 +1416,7 @@ fn git_files(dir: &Path, output_dirs: &[PathBuf]) -> Result<Vec<GitFile>, String
         .iter()
         .filter_map(|o| o.strip_prefix(dir).ok())
         .filter(|rel| !rel.as_os_str().is_empty())
-        .map(|rel| format!(":(exclude,literal){}", rel.to_string_lossy().replace('\\', "/")))
+        .map(|rel| format!(":(exclude,literal){}", slash_path(rel)))
         .collect();
     let mut args = vec!["-z", "--others", "--exclude-standard", "--", "."];
     args.extend(excludes.iter().map(String::as_str));
@@ -941,6 +1434,23 @@ fn git_files(dir: &Path, output_dirs: &[PathBuf]) -> Result<Vec<GitFile>, String
     Ok(files)
 }
 
+/// The relative `path` with `/` between its components, as Git writes paths. A `\` inside a Unix
+/// file name stays as it is.
+fn slash_path(path: &Path) -> String {
+    path.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
+}
+
+/// Adds `path` (with `/` between components) and every folder above it to `names`.
+fn insert_with_folders(names: &mut BTreeSet<String>, path: &str) {
+    let mut folder = Path::new(path).parent();
+    while let Some(f) = folder.filter(|f| !f.as_os_str().is_empty()) {
+        // `parent` slices the string, so the `/` separators stay as they are.
+        names.insert(f.to_string_lossy().into_owned());
+        folder = f.parent();
+    }
+    names.insert(path.to_owned());
+}
+
 /// The files of the crate in `dir` (from [`git_files`]) outside Cargo's `output_dirs`: every file
 /// and folder name, the symbolic links (recorded as such by Git, or one on disk), and the lines of
 /// its `.rs`, `.md` and `.toml` files that hold the word ShellCraft. A listed file that is not on
@@ -951,7 +1461,7 @@ fn crate_files(dir: &Path, files: &[GitFile], output_dirs: &[PathBuf]) -> Result
     for file in files {
         let path = dir.join(&file.path);
         if file.submodule {
-            names.insert(file.path.clone());
+            insert_with_folders(&mut names, &file.path);
             out.submodules.push(file.path.clone());
             continue;
         }
@@ -967,12 +1477,12 @@ fn crate_files(dir: &Path, files: &[GitFile], output_dirs: &[PathBuf]) -> Result
         for part in Path::new(&file.path).parent().into_iter().flat_map(Path::components) {
             sofar.push(part);
             if std::fs::symlink_metadata(dir.join(&sofar)).is_ok_and(|m| m.is_symlink()) {
-                linked_folder = Some(sofar.to_string_lossy().replace('\\', "/"));
+                linked_folder = Some(slash_path(&sofar));
                 break;
             }
         }
         if let Some(folder) = linked_folder {
-            names.insert(folder.clone());
+            insert_with_folders(&mut names, &folder);
             if !out.links.contains(&folder) {
                 out.links.push(folder);
             }
@@ -987,12 +1497,7 @@ fn crate_files(dir: &Path, files: &[GitFile], output_dirs: &[PathBuf]) -> Result
             Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => continue,
             Err(e) => return Err(format!("read {}: {e}", path.display())),
         };
-        let mut folder = Path::new(&file.path).parent();
-        while let Some(f) = folder.filter(|f| !f.as_os_str().is_empty()) {
-            names.insert(f.to_string_lossy().replace('\\', "/"));
-            folder = f.parent();
-        }
-        names.insert(file.path.clone());
+        insert_with_folders(&mut names, &file.path);
         if file.link || meta.is_symlink() {
             out.links.push(file.path.clone());
             continue;
@@ -1110,10 +1615,54 @@ fn resolved_outside(dir: &Path, sources: &[String]) -> Result<Vec<String>, Strin
         .collect())
 }
 
+/// The `sources` (rooted, or relative to `dir`) inside `dir` that are not among the crate's `files`
+/// from [`git_files`] under the same path, such as an ignored `src/generated.rs` named as
+/// `[lib] path`, or that are not a file on disk, such as a tracked file deleted and not yet
+/// staged. A path with a `..` component is always listed: the folders it goes through may not
+/// move with the crate.
+fn sources_git_leaves_out(dir: &Path, sources: &[String], files: &[GitFile]) -> Vec<String> {
+    sources
+        .iter()
+        .filter(|s| {
+            // Compared by component, so `docs/./guide.md` is `docs/guide.md`. A relative source is
+            // read as it is: joining it to a verbatim Windows path would resolve its `..`.
+            let path = Path::new(s.as_str());
+            let raw = if path.has_root() { path.strip_prefix(dir).ok() } else { Some(path) };
+            raw.is_some_and(|raw| match path_parts(raw) {
+                None => true,
+                Some(rel) => {
+                    let on_disk = std::fs::symlink_metadata(dir.join(raw)).is_ok_and(|m| m.is_file());
+                    !on_disk || !files.iter().any(|f| !f.submodule && path_parts(Path::new(&f.path)).is_some_and(|parts| parts == rel))
+                }
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// The components of the relative `path` without `.` ones, or `None` when it has a `..` component
+/// or is rooted.
+fn path_parts(path: &Path) -> Option<Vec<Component<'_>>> {
+    let mut parts = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::Normal(_) => parts.push(c),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts)
+}
+
 /// The folders from the crate `name`'s folder `dir` up to the workspace `root` (without it) that are
-/// a symbolic link or the root of another Git repository, such as a submodule.
+/// a symbolic link or the root of another Git repository, such as a submodule, and `dir` itself when
+/// it is not inside `root`.
 fn folder_problems(name: &str, root: &Path, dir: &Path) -> Vec<String> {
     let mut problems = Vec::new();
+    if !dir.starts_with(root) {
+        // Another checkout's files, which this repository does not hold.
+        problems.push(format!("`{name}`: its folder {} is outside the workspace; a craft crate holds its own files", dir.display()));
+    }
     for folder in dir.ancestors().take_while(|a| *a != root && a.starts_with(root)) {
         if std::fs::symlink_metadata(folder).is_ok_and(|m| m.is_symlink()) {
             problems.push(format!("`{name}`: its folder {} is a symbolic link; a craft crate holds its own files", folder.display()));
@@ -1136,19 +1685,38 @@ pub fn output_dirs(metadata: &[u8]) -> Result<Vec<PathBuf>, String> {
 /// Runs every rule over the workspace.
 pub fn run(root: &Path, log: &mut StepLog) -> Result<(), String> {
     log.command("cargo xtask layers");
+    let targets: Vec<&str> = RELEASE_TARGETS.iter().chain(MUSL_TARGETS).chain([&wasm::TARGET]).copied().collect();
+    let (count, problems) = check_workspace(root, wasm::crates(), &targets)?;
+    if problems.is_empty() {
+        println!("layers: {count} crates follow the layer and manifest rules");
+        Ok(())
+    } else {
+        Err(format!("layers: {} problems:\n  {}", problems.len(), problems.join("\n  ")))
+    }
+}
+
+/// Every rule over the workspace at `root`, with `wasm_crates` as the `cargo xtask wasm` list, on
+/// `targets` (the release, musl and web targets, or some of them): the number of members and the
+/// problems found.
+fn check_workspace(root: &Path, wasm_crates: &[&str], targets: &[&str]) -> Result<(usize, Vec<String>), String> {
     let agents_path = root.join("AGENTS.md");
     let agents = std::fs::read_to_string(&agents_path).map_err(|e| format!("read {}: {e}", agents_path.display()))?;
     let table = parse_table(&agents)?;
     let metadata = workspace::resolved_metadata(root)?;
     let packages = packages(&metadata)?;
     let output_dirs = output_dirs(&metadata)?;
+    // The root as Cargo spells it, which the member paths share.
+    let cargo_root = {
+        let value: serde_json::Value = serde_json::from_slice(&metadata).map_err(|e| format!("cargo metadata: {e}"))?;
+        PathBuf::from(str_field(&value, "workspace_root").ok_or("cargo metadata: no `workspace_root`")?)
+    };
     let mut problems = check_layers(&table, &packages);
     for p in &packages {
         let manifest_path = Path::new(&p.manifest_path);
         let manifest = std::fs::read_to_string(manifest_path).map_err(|e| format!("read {}: {e}", manifest_path.display()))?;
         if is_craft_crate(&p.name) {
             let dir = manifest_path.parent().ok_or_else(|| format!("`{}`: the manifest {} has no folder", p.name, manifest_path.display()))?;
-            let folder = folder_problems(&p.name, root, dir);
+            let folder = folder_problems(&p.name, &cargo_root, dir);
             if !folder.is_empty() {
                 // The files there are not the crate's own, so they are not scanned.
                 problems.extend(folder);
@@ -1164,38 +1732,99 @@ pub fn run(root: &Path, log: &mut StepLog) -> Result<(), String> {
                     p.files_outside.push(source);
                 }
             }
+            // The manifest moves with the crate too.
+            let sources: Vec<String> = p.sources.iter().cloned().chain(["Cargo.toml".to_owned()]).collect();
+            for source in sources_git_leaves_out(dir, &sources, &files) {
+                if !p.files_outside.contains(&source) {
+                    problems.push(format!(
+                        "`{}` uses {source}, which is not a path without `..` to a file Git tracks or would add; a craft crate holds its own files",
+                        p.name
+                    ));
+                }
+            }
             problems.extend(check_craft_crate(&p, &manifest, has_readme, &crate_files(dir, &files, &output_dirs)?));
         } else {
             problems.extend(check_inherited(p, &manifest));
         }
     }
-    let apps: Vec<(&Package, &[Banned])> =
-        MUST_NOT_LINK.iter().filter_map(|(dir, banned)| packages.iter().find(|p| p.dir.as_deref() == Some(*dir)).map(|p| (p, *banned))).collect();
+    if !wasm_crates.is_empty() {
+        let root_manifest_path = root.join("Cargo.toml");
+        let root_manifest = std::fs::read_to_string(&root_manifest_path).map_err(|e| format!("read {}: {e}", root_manifest_path.display()))?;
+        let root_doc = Document::parse(root_manifest.as_str()).map_err(|e| format!("{}: not valid TOML: {e}", root_manifest_path.display()))?;
+        let workspace_dependencies = root_doc.get("workspace").and_then(|w| w.get("dependencies"));
+        for name in wasm_crates {
+            let p = packages.iter().find(|p| p.name == *name).ok_or_else(|| format!("`{name}` in xtask/src/wasm.rs is not a workspace member"))?;
+            let manifest = std::fs::read_to_string(&p.manifest_path).map_err(|e| format!("read {}: {e}", p.manifest_path))?;
+            problems.extend(check_wasm_features(name, &manifest, workspace_dependencies));
+            // The features Cargo turns on for the web build and the web test build, with the crate's
+            // own features on but the test-only ones, which a facade feature that turns on another
+            // one also reaches.
+            let tree = package_tree(root, &p.name, &p.id, Features::Listed(&app_features(p)), wasm::TARGET, "normal,dev")?;
+            match linked_in_tests(&tree, &p.name) {
+                Some(linked) => problems.extend(check_web_features(name, &linked)),
+                None => problems.push(format!("`{name}`: cargo tree did not list it, so its features for {} could not be checked", wasm::TARGET)),
+            }
+        }
+        // `cargo xtask wasm` checks the listed crates in one command, which resolves their features
+        // together.
+        if wasm_crates.len() > 1 {
+            let selection: Vec<(&str, &str)> =
+                wasm_crates.iter().filter_map(|name| packages.iter().find(|p| p.name == *name)).map(|p| (p.name.as_str(), p.id.as_str())).collect();
+            let tree = selection_tree(root, &selection, Features::Listed(&[]), wasm::TARGET, "normal")?;
+            let together = wasm_crates.join(", ");
+            for (name, _) in &selection {
+                if let Some(linked) = linked(&tree, name) {
+                    for problem in check_web_features(name, &linked).into_iter().filter(|p| !problems.contains(p)).collect::<Vec<_>>() {
+                        problems.push(format!("{problem} when it is checked together with the other crates in xtask/src/wasm.rs ({together})"));
+                    }
+                }
+            }
+        }
+    }
+    let apps: Vec<(&Package, &App)> =
+        MUST_NOT_LINK.iter().filter_map(|app| packages.iter().find(|p| p.dir.as_deref() == Some(app.dir)).map(|p| (p, app))).collect();
     let members: Vec<Member> = packages
         .iter()
         .filter_map(|p| Path::new(&p.manifest_path).parent().map(|d| Member { name: p.name.clone(), dir: d.display().to_string() }))
         .collect();
     // Each problem with the targets it occurs on, in the order of RELEASE_TARGETS.
     let mut found: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-    // The web build is checked for the layer and craft crate rules; the GUI is a desktop app.
-    for &target in RELEASE_TARGETS.iter().chain([&wasm::TARGET]) {
+    // Every member is checked for the layer and craft crate rules on the release targets and the web
+    // target; each app only on the targets it is built for.
+    for &target in targets {
         let mut on_target = Vec::new();
-        // Each member on its own, as Cargo resolves its features when it alone is built.
-        // Tooling may depend on any crate, so its own tree has nothing to check unless it is a craft
-        // crate.
-        for p in packages.iter().filter(|p| is_craft_crate(&p.name) || table.get(&p.name).is_some_and(|l| *l != Layer::Tooling)) {
-            let tree = package_tree(root, &p.name, &p.id, target, "normal,build,dev")?;
-            on_target.extend(check_reach(&table, &reaches(&tree, &members)?));
-            on_target.extend(check_craft_paths(&tree, &members));
-        }
-        if target != wasm::TARGET {
-            for (app, banned) in &apps {
-                let tree = package_tree(root, &app.name, &app.id, target, "normal,no-proc-macro")?;
-                match linked(&tree, &app.name) {
-                    Some(linked) => on_target.extend(check_links(&app.name, banned, &linked)),
-                    None => on_target.push(format!("`{}`: cargo tree did not list the app, so its dependencies could not be checked", app.name)),
+        // On a static Linux target, the members that an app built for it links.
+        let mut musl_linked: BTreeSet<String> = BTreeSet::new();
+        for (p, app) in apps.iter().filter(|(_, app)| app.targets.contains(target)) {
+            let tree = package_tree(root, &p.name, &p.id, Features::Listed(&app_features(p)), target, "normal,build")?;
+            if MUSL_TARGETS.contains(&target) {
+                musl_linked.extend(linked_members(&tree, &p.name, &members).into_iter().flatten());
+            }
+            match linked(&tree, &p.name) {
+                Some(linked) => on_target.extend(check_links(&p.name, app.banned, &linked)),
+                None => on_target.push(format!("`{}`: cargo tree did not list the app, so its dependencies could not be checked", p.name)),
+            }
+            if !app.release_banned.is_empty() {
+                let tree = package_tree(root, &p.name, &p.id, Features::Listed(&[]), target, "normal,build")?;
+                match linked(&tree, &p.name) {
+                    Some(linked) => {
+                        on_target.extend(check_links(&p.name, app.release_banned, &linked).into_iter().map(|m| format!("{m} in a release build")))
+                    }
+                    None => on_target.push(format!("`{}`: cargo tree did not list the app, so its release build could not be checked", p.name)),
                 }
             }
+        }
+        // Each member on its own, as Cargo resolves its features when it alone is built. On a static
+        // Linux target only the members an app built for it links are walked.
+        // Tooling may depend on any crate, so its own tree has nothing to check unless it is a craft
+        // crate.
+        for p in packages.iter().filter(|p| {
+            (is_craft_crate(&p.name) || table.get(&p.name).is_some_and(|l| *l != Layer::Tooling))
+                && (!MUSL_TARGETS.contains(&target) || musl_linked.contains(&p.name))
+        }) {
+            let tree = package_tree(root, &p.name, &p.id, Features::All, target, "normal,build,dev")?;
+            on_target.extend(check_reach(&table, &reaches(&tree, &members)?));
+            on_target.extend(check_craft_paths(&tree, &members));
         }
         on_target.sort();
         on_target.dedup();
@@ -1204,12 +1833,7 @@ pub fn run(root: &Path, log: &mut StepLog) -> Result<(), String> {
         }
     }
     problems.extend(found.into_iter().map(|(problem, targets)| format!("{problem} (on {})", targets.join(", "))));
-    if problems.is_empty() {
-        println!("layers: {} crates follow the layer and manifest rules", packages.len());
-        Ok(())
-    } else {
-        Err(format!("layers: {} problems:\n  {}", problems.len(), problems.join("\n  ")))
-    }
+    Ok((packages.len(), problems))
 }
 
 #[cfg(test)]
@@ -1252,6 +1876,7 @@ The GUI must not link tokio.
             deps,
             files_outside: Vec::new(),
             sources: Vec::new(),
+            features: Vec::new(),
         }
     }
 
@@ -1335,7 +1960,13 @@ The GUI must not link tokio.
             check_layers(&t, &with_deps("xtask", vec![dep("shellcraft-ui-egui", Kind::Normal), ext("egui", Kind::Normal)])),
             Vec::<String>::new()
         );
-        let reached = [Reach { from: "xtask".into(), via: "shellcraft-ui-egui".into(), ui: Some("egui".into()), members: Vec::new() }];
+        let reached = [Reach {
+            from: "xtask".into(),
+            via: FACADE.into(),
+            via_ui_feature: Some("ui".into()),
+            ui: Some("the UI crate `egui`".into()),
+            members: Vec::new(),
+        }];
         assert_eq!(check_reach(&t, &reached), Vec::<String>::new());
     }
 
@@ -1349,13 +1980,17 @@ The GUI must not link tokio.
     #[test]
     fn only_the_top_layer_depends_on_ui_crates() {
         let t = table();
-        for ui in ["egui", "eframe", "winit", "rfd", "egui_extras", "egui-wgpu"] {
+        for ui in ["egui", "eframe", "winit", "rfd", "egui_extras", "egui-wgpu", "craft-ui", "craft-ui-contract", "craft-color-ui"] {
             assert_eq!(check_layers(&t, &with_deps("shellcraft-ui-egui", vec![ext(ui, Kind::Normal)])), Vec::<String>::new(), "{ui}");
             let problems = check_layers(&t, &with_deps("shellcraft-engine", vec![ext(ui, Kind::Normal)]));
             assert_eq!(problems.len(), 1, "{ui}: {problems:?}");
             assert!(problems[0].contains("UI crate"), "{problems:?}");
         }
-        assert_eq!(check_layers(&t, &with_deps("shellcraft-engine", vec![ext("eguilike", Kind::Normal)])), Vec::<String>::new());
+        // The facade's features come from each member's own `cargo tree`, so a direct dependency on
+        // it is judged there.
+        for other in ["eguilike", "craft-uikit", "craft-build", FACADE] {
+            assert_eq!(check_layers(&t, &with_deps("shellcraft-engine", vec![ext(other, Kind::Normal)])), Vec::<String>::new(), "{other}");
+        }
         let mut with_widgets = with_deps("shellcraft-engine", vec![dep("egui-widgets", Kind::Normal)]);
         with_widgets.push(pkg("egui-widgets", vec![]));
         let mut t = t;
@@ -1454,9 +2089,13 @@ The GUI must not link tokio.
         in_folder.manifest_path = "/elsewhere/shellcraft-queue/Cargo.toml".into();
         let problems = check_craft_crate(&in_folder, &craft_manifest(), true, &CrateFiles::default());
         assert_eq!(problems, ["`craft-queue`: its folder shellcraft-queue uses the word ShellCraft"]);
-        for name in ["src/shellcraft.rs", "fixtures/ShellCraft.json", "shellcraft/data.bin"] {
+        for name in ["src/shellcraft.rs", "fixtures/ShellCraft.json", "shellcraft"] {
             assert_eq!(craft(&craft_manifest(), true, vec![], &[name], &[]), [format!("`craft-queue`: the name {name} uses the word ShellCraft")]);
         }
+        // A folder with the word is reported once, not again for each file below it.
+        let names = ["fixtures", "fixtures/ShellCraft", "fixtures/ShellCraft/a.json", "fixtures/ShellCraft/b.json"];
+        let problems = craft(&craft_manifest(), true, vec![], &names, &[]);
+        assert_eq!(reported(&problems, &["fixtures/ShellCraft", "uses the word ShellCraft"]), 1, "{problems:?}");
     }
 
     #[test]
@@ -1538,7 +2177,9 @@ The GUI must not link tokio.
         let git = |args: &[&str]| -> String {
             let mut c = std::process::Command::new("git");
             c.env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").env_remove("GIT_CONFIG");
-            c.env("GIT_TEMPLATE_DIR", &template).args(args).current_dir(&dir);
+            // No hook runs, including one a global `core.hooksPath` names.
+            let no_hooks = format!("core.hooksPath={}", dir.join("no-hooks").display());
+            c.env("GIT_TEMPLATE_DIR", &template).args(["-c", &no_hooks]).args(args).current_dir(&dir);
             let out = c.output().unwrap();
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8_lossy(&out.stdout).trim().to_owned()
@@ -1671,6 +2312,9 @@ shellcraft-engine v0.1.0 (/w/crates/engine)||
         std::fs::write(root.join(".git"), "").unwrap();
         let plain = folder_problems("craft-plain", &root, &root.join("crates/plain"));
         let sub = folder_problems("craft-sub", &root, &root.join("crates/sub"));
+        // A member in a sibling checkout, which `package.workspace` allows.
+        let sibling = folder_problems("craft-sibling", &root, &root.with_file_name("sibling-checkout").join("crate"));
+        assert_eq!(reported(&sibling, &["`craft-sibling`", "outside the workspace"]), 1, "{sibling:?}");
         #[cfg(unix)]
         let linked = {
             std::os::unix::fs::symlink(root.join("crates/plain"), root.join("crates/alias")).unwrap();
@@ -1709,6 +2353,65 @@ shellcraft-engine v0.1.0 (/w/crates/engine)||
         p.files_outside = vec!["/w/shared/lib.rs".into()];
         let problems = check_craft_crate(&p, &craft_manifest(), true, &CrateFiles::default());
         assert_eq!(problems, ["`craft-queue` uses /w/shared/lib.rs, which is outside its folder; a craft crate holds its own files"]);
+        // Declared paths with `..`, which Cargo resolves before it reports them.
+        let manifest = format!(
+            "test = [{{ name = \"t\", path = \"tests/../t.rs\" }}]\n{}\n[lib]\npath = \"src/../src/lib.rs\"\n\n[[bin]]\nname = \"a\"\npath = \"src/bin/a.rs\"\n\n[[bin]]\nname = \"b\"\npath = \"x/../src/b.rs\"\n",
+            craft_manifest().replace("[package]\n", "[package]\nbuild = \"src/../build.rs\"\n")
+        );
+        let problems = check_craft_crate(&pkg("craft-queue", vec![]), &manifest, true, &CrateFiles::default());
+        assert_eq!(reported(&problems, &["`craft-queue`", "declares the path", "`..`"]), 4, "{problems:?}");
+        assert_eq!(reported(&problems, &["src/bin/a.rs"]), 0, "{problems:?}");
+        // Absolute declared paths name one checkout.
+        let manifest = craft_manifest().replace("[package]\n", "[package]\nreadme = \"/w/q/README.md\"\n") + "\n[lib]\npath = \"/w/q/src/lib.rs\"\n";
+        let problems = check_craft_crate(&pkg("craft-queue", vec![]), &manifest, true, &CrateFiles::default());
+        assert_eq!(reported(&problems, &["`craft-queue`", "declares the path", "absolute"]), 2, "{problems:?}");
+    }
+
+    #[test]
+    fn a_craft_crate_builds_only_from_files_git_tracks_or_would_add() {
+        let git = |path: &str, submodule: bool| GitFile { path: path.into(), link: false, tracked: true, sparse: false, submodule };
+        let files = [git("src/lib.rs", false), git("README.md", false), git("vendor", true), git("docs/guide.md", false), git("docs/gone.md", false)];
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let dir = std::env::temp_dir().join(format!("xtask-layers-src-{}-{nanos}", std::process::id()));
+        for folder in ["src", "docs", "vendor", "scratch"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+        }
+        for file in ["src/lib.rs", "src/generated.rs", "README.md", "docs/guide.md"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+        let sources = vec![
+            at("src/lib.rs"),
+            at("src/generated.rs"),
+            "README.md".to_owned(),
+            at("vendor"),
+            "../shared/x.rs".to_owned(),
+            "/elsewhere/y.rs".to_owned(),
+            "docs/./guide.md".to_owned(),
+            "scratch/../README.md".to_owned(),
+            "docs/gone.md".to_owned(),
+        ];
+        let left_out = sources_git_leaves_out(&dir, &sources, &files);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            left_out,
+            [at("src/generated.rs"), at("vendor"), "../shared/x.rs".to_owned(), "scratch/../README.md".to_owned(), "docs/gone.md".to_owned()]
+        );
+    }
+
+    #[test]
+    fn writes_paths_with_slashes_between_components() {
+        assert_eq!(slash_path(&Path::new("out").join("debug")), "out/debug");
+        #[cfg(unix)]
+        assert_eq!(slash_path(Path::new("build\\cache/x")), "build\\cache/x", "a backslash in a Unix name");
+    }
+
+    #[test]
+    fn lists_the_folders_above_a_submodule() {
+        let files = [GitFile { path: "fixtures/ShellCraft/vendor".into(), link: false, tracked: true, sparse: false, submodule: true }];
+        let listed = crate_files(Path::new("/w/q"), &files, &[]).unwrap();
+        assert_eq!(listed.names, ["fixtures", "fixtures/ShellCraft", "fixtures/ShellCraft/vendor"]);
+        assert_eq!(listed.submodules, ["fixtures/ShellCraft/vendor"]);
     }
 
     #[test]
@@ -1789,7 +2492,8 @@ repository.workspace = true
     /// member's name.
     const METADATA: &[u8] = br#"{"workspace_root":"/w","workspace_members":["engine","queue"],
         "packages":[
-            {"name":"shellcraft-engine","id":"engine","manifest_path":"/w/crates/engine/Cargo.toml","readme":"../../README.md",
+            {"name":"shellcraft-engine","id":"engine","manifest_path":"/w/crates/engine/Cargo.toml","readme":"../../README.md","license_file":"../../LICENSE-MIT",
+             "features":{"default":["web"],"web":[],"screen-testing":[]},
              "targets":[{"src_path":"/w/crates/engine/src/lib.rs"},{"src_path":"/w/crates/engine-shared/main.rs"}]},
             {"name":"craft-queue","id":"queue","manifest_path":"/other/q/Cargo.toml","readme":"./docs/../README.md",
              "targets":[{"src_path":"/other/q/src/lib.rs"}]},
@@ -1832,8 +2536,11 @@ repository.workspace = true
                 ext("helper", Kind::Normal)
             ]
         );
-        assert_eq!(p.files_outside, ["/w/crates/engine-shared/main.rs", "../../README.md"]);
+        assert_eq!(p.files_outside, ["/w/crates/engine-shared/main.rs", "../../README.md", "../../LICENSE-MIT"]);
+        assert_eq!(p.features, ["default", "screen-testing", "web"]);
+        assert_eq!(app_features(p), ["default", "web"], "test-only features are left out");
         assert_eq!(list[1].dir, None);
+        assert_eq!(list[1].features, Vec::<String>::new());
         assert_eq!(list[1].files_outside, Vec::<String>::new());
         let no_resolve = String::from_utf8_lossy(METADATA).replace("\"resolve\"", "\"resolved\"");
         assert!(packages(no_resolve.as_bytes()).unwrap_err().contains("resolved dependency graph"));
@@ -1853,17 +2560,19 @@ repository.workspace = true
     }
 
     /// [`package_tree`] output with `normal,build,dev` edges for four members.
-    /// `shellcraft-engine` reaches `egui` through `craft-ui` and the member `craft-queue` through
-    /// `helper`, and uses a registry package that only shares `craft-queue`'s name. `craft-queue`
-    /// reaches `shellcraft-proto` through `neutral`, and a `shellcraft-core` from git through
-    /// `gitdep`. `painter` depends on `egui` only in the host build that `shellcraft-ui-egui`'s
-    /// build script uses; the build for the target that `shellcraft-engine` uses has no
-    /// dependencies. The host build of `shellcraft-proto` below `shellcraft-ui-egui` reaches `egui`
-    /// through `uikit`; its own tree is clean.
+    /// `shellcraft-engine` reaches `egui` through `toolkit` and the member `craft-queue` through
+    /// `helper`, and uses a registry package that only shares `craft-queue`'s name. It depends on the
+    /// `craft` facade with its `ui` feature, which brings in `craft-ui`. `craft-queue` reaches `shellcraft-proto` through `neutral`, and a
+    /// `shellcraft-core` from git through `gitdep`. `painter` depends on `egui` only in the host
+    /// build that `shellcraft-ui-egui`'s build script uses; the build for the target that
+    /// `shellcraft-engine` uses has no dependencies. The host build of `shellcraft-proto` below
+    /// `shellcraft-ui-egui` reaches `egui` through `uikit`; its own tree is clean.
     const REACH_TREE: &str = "\
 shellcraft-engine v0.1.0 (/w/crates/engine)||
+├── craft v0.1.0 (https://github.com/storytold/craft-libs?rev=27e5af8#27e5af81)|i18n,ui|
+│   └── craft-ui v0.1.0 (https://github.com/storytold/craft-libs?rev=27e5af8#27e5af81)||
 ├── craft-queue v0.1.0 (/w/crates/queue)||
-├── craft-ui v0.1.0|default|
+├── toolkit v0.1.0|default|
 │   └── widgets v0.1.0||
 │       └── egui v0.33.0|default|
 ├── helper v0.1.0||
@@ -1906,20 +2615,27 @@ shellcraft-ui-egui v0.1.0 (/w/crates/ui)||
         let reach = |from: &str, via: &str, ui: Option<&str>, members: &[&str]| Reach {
             from: from.into(),
             via: via.into(),
-            ui: ui.map(str::to_owned),
+            via_ui_feature: None,
+            ui: ui.map(|name| format!("the UI crate `{name}`")),
             members: members.iter().map(|m| (*m).to_owned()).collect(),
         };
+        let facade = Reach { via_ui_feature: Some("ui".into()), ..reach("shellcraft-engine", FACADE, Some("craft-ui"), &[]) };
         assert_eq!(
             reaches(REACH_TREE, &reach_members()).unwrap(),
             [
+                facade,
                 reach("shellcraft-engine", "craft-queue", None, &["shellcraft-proto"]),
-                reach("shellcraft-engine", "craft-ui", Some("egui"), &[]),
+                reach("shellcraft-engine", "toolkit", Some("egui"), &[]),
                 reach("shellcraft-engine", "helper", None, &["craft-queue", "shellcraft-proto"]),
                 reach("craft-queue", "neutral", None, &["shellcraft-proto"]),
                 reach("shellcraft-ui-egui", "painter", Some("egui"), &[]),
                 reach("shellcraft-ui-egui", "shellcraft-proto", Some("egui"), &[]),
             ]
         );
+        // The facade with a UI feature further down is a UI package too.
+        let below = "shellcraft-a v0.1.0 (/w/crates/a)||\n└── lib1 v1.0.0||\n    └── craft v0.1.0|cloud-ui-share|\n";
+        let a = [Member { name: "shellcraft-a".into(), dir: "/w/crates/a".into() }];
+        assert_eq!(reaches(below, &a).unwrap()[0].ui.as_deref(), Some("`craft` with its UI feature `cloud-ui-share`"));
     }
 
     #[test]
@@ -1934,6 +2650,27 @@ shellcraft-a v0.1.0 (/w/crates/a)||
         let reached = reaches(tree, &members).unwrap();
         assert_eq!(reached.len(), 1);
         assert_eq!(reached[0].members, ["shellcraft-b", "shellcraft-c"]);
+    }
+
+    #[test]
+    fn lists_the_members_an_app_links_by_their_folders() {
+        // The agent links an outside package named like the member `craft-queue`, and the member
+        // `shellcraft-b` through an outside package; `shellcraft-c` only builds for the host.
+        let tree = "\
+shellcraft-agent v0.1.0 (/w/apps/shellcraft-agent)||
+├── craft-queue v0.2.0 (/v/craft-queue)||
+├── lib1 v1.0.0||
+│   └── shellcraft-b v0.1.0 (/w/crates/b)||
+└── [build-dependencies]
+    └── shellcraft-c v0.1.0 (/w/crates/c)||
+";
+        let members = [("craft-queue", "/w/crates/queue"), ("shellcraft-b", "/w/crates/b"), ("shellcraft-c", "/w/crates/c")]
+            .map(|(name, dir)| Member { name: name.into(), dir: dir.into() });
+        assert_eq!(
+            linked_members(tree, "shellcraft-agent", &members),
+            Some(BTreeSet::from(["shellcraft-agent".to_owned(), "shellcraft-b".to_owned()]))
+        );
+        assert_eq!(linked_members(tree, "shellcraft-cli", &members), None);
     }
 
     #[test]
@@ -1962,14 +2699,18 @@ shellcraft-a v0.1.0 (/w/crates/a)||
     fn a_crate_below_the_top_layer_reaches_no_ui_crate_through_other_packages() {
         let mut t = reach_table();
         let problems = check_reach(&t, &reaches(REACH_TREE, &reach_members()).unwrap());
-        assert!(
-            problems.contains(&"`shellcraft-engine` (L4) depends on `craft-ui`, which depends on the UI crate `egui`; only L6 crates may".to_owned()),
-            "{problems:?}"
-        );
+        assert_eq!(reported(&problems, &["`shellcraft-engine`"]), 3, "{problems:?}");
+        assert_eq!(reported(&problems, &["`shellcraft-engine`", "`craft`", "`ui`"]), 1, "{problems:?}");
+        assert_eq!(reported(&problems, &["`shellcraft-engine`", "`craft`", "`craft-ui`"]), 1, "{problems:?}");
+        assert_eq!(reported(&problems, &["`shellcraft-engine`", "`toolkit`", "`egui`"]), 1, "{problems:?}");
+        // The facade without a UI feature is not a UI package.
+        let plain = "shellcraft-a v0.1.0 (/w/crates/a)||\n├── craft v0.1.0|i18n,theme|\n└── lib1 v1.0.0||\n    └── craft v0.1.0|i18n,theme| (*)\n";
+        let a = [Member { name: "shellcraft-a".into(), dir: "/w/crates/a".into() }];
+        assert_eq!(reaches(plain, &a).unwrap(), Vec::<Reach>::new());
         assert!(!problems.iter().any(|p| p.contains("painter")), "the UI crate comes only with a feature L4 does not use: {problems:?}");
         t.insert("shellcraft-engine".into(), Layer::Level(UI_LAYER));
         let problems = check_reach(&t, &reaches(REACH_TREE, &reach_members()).unwrap());
-        assert!(!problems.iter().any(|p| p.contains("`shellcraft-engine`") && p.contains("UI crate")), "{problems:?}");
+        assert!(!problems.iter().any(|p| p.contains("`shellcraft-engine`") && p.contains("UI")), "{problems:?}");
         assert!(!problems.iter().any(|p| p.contains("`uikit`")), "a member below the root is checked in its own tree: {problems:?}");
     }
 
@@ -1979,15 +2720,9 @@ shellcraft-a v0.1.0 (/w/crates/a)||
         let tree = reaches(REACH_TREE, &reach_members()).unwrap();
         assert!(!check_reach(&t, &tree).iter().any(|p| p.contains("`helper`")));
         t.insert("craft-queue".into(), Layer::Level(5));
-        assert!(
-            check_reach(&t, &tree)
-                .contains(&"`shellcraft-engine` (L4) depends on `helper`, which depends on `craft-queue` (L5), a higher layer".to_owned())
-        );
+        assert_eq!(reported(&check_reach(&t, &tree), &["`shellcraft-engine`", "`helper`", "`craft-queue` (L5)"]), 1);
         t.insert("craft-queue".into(), Layer::Tooling);
-        assert!(
-            check_reach(&t, &tree)
-                .contains(&"`shellcraft-engine` (L4) depends on `helper`, which depends on the tooling crate `craft-queue`".to_owned())
-        );
+        assert_eq!(reported(&check_reach(&t, &tree), &["`shellcraft-engine`", "`helper`", "tooling", "`craft-queue`"]), 1);
     }
 
     #[test]
@@ -2019,15 +2754,18 @@ shellcraft v0.1.0 (/w/apps/my | folder/shellcraft)|default|
 └── rusqlite v0.37.0||
 ";
 
+    fn row(dir: &str) -> &'static App {
+        MUST_NOT_LINK.iter().find(|app| app.dir == dir).unwrap()
+    }
+
     fn gui_links(tree: &str) -> Vec<String> {
-        let (_, banned) = MUST_NOT_LINK[0];
-        check_links("shellcraft", banned, &linked(tree, "shellcraft").unwrap())
+        check_links("shellcraft", row("apps/shellcraft").banned, &linked(tree, "shellcraft").unwrap())
     }
 
     #[test]
     fn reads_what_the_gui_links() {
         let l = linked(TREE, "shellcraft").unwrap();
-        assert_eq!(l.keys().map(String::as_str).collect::<Vec<_>>(), ["craft-chat", "craft-keystore", "shellcraft", "tokio-free"]);
+        assert_eq!(l.keys().map(String::as_str).collect::<Vec<_>>(), ["craft-chat", "craft-keystore", "tokio-free"], "the root is not in its list");
         assert!(l["craft-chat"].contains("stream"));
         assert!(linked(TREE, "tokio").is_none(), "only roots are apps");
         assert!(linked(TREE, "shellcraft-cli").is_none());
@@ -2042,5 +2780,387 @@ shellcraft v0.1.0 (/w/apps/my | folder/shellcraft)|default|
 
         let with_http = TREE.replace("default,stream", "default,http,stream");
         assert_eq!(gui_links(&with_http), ["`shellcraft` links `craft-chat` with its `http` feature, which it must not link"]);
+
+        for feature in ["update", "mcp-server", "control-agents", "automation-agents"] {
+            let with_facade = TREE.replace("└── tokio-free", &format!("├── craft v0.1.0|automation,{feature},ui|\n└── tokio-free"));
+            assert_eq!(gui_links(&with_facade), [format!("`shellcraft` links `craft` with its `{feature}` feature, which it must not link")]);
+        }
+        let allowed = TREE.replace("└── tokio-free", "├── craft v0.1.0|automation,ui,window|\n└── tokio-free");
+        assert_eq!(gui_links(&allowed), Vec::<String>::new());
+    }
+
+    /// `cargo tree --edges normal,build` output of three apps: the daemon links the facade with its
+    /// `ui` feature and `egui`, the CLI links `craft-ui-widgets`, and the agent links no UI package.
+    const APPS_TREE: &str = "\
+shellcraftd v0.1.0 (/w/apps/shellcraftd)||
+└── craft v0.1.0 (https://github.com/storytold/craft-libs?rev=27e5af8#27e5af81)|ipc,ui,update|
+    └── egui v0.33.0|default|
+
+shellcraft-cli v0.1.0 (/w/apps/shellcraft-cli)||
+└── craft-ui-widgets v0.1.0||
+
+shellcraft-agent v0.1.0 (/w/apps/shellcraft-agent)||
+└── craft v0.1.0 (https://github.com/storytold/craft-libs?rev=27e5af8#27e5af81)|ipc|
+";
+
+    #[test]
+    fn the_daemon_cli_and_agent_link_no_ui_package() {
+        let links = |dir: &str, app: &str| check_links(app, row(dir).banned, &linked(APPS_TREE, app).unwrap());
+        assert_eq!(
+            links("apps/shellcraftd", "shellcraftd"),
+            [
+                "`shellcraftd` links `craft` with its UI feature `ui`, which it must not link",
+                "`shellcraftd` links the UI crate `egui`, which it must not link"
+            ]
+        );
+        assert_eq!(
+            links("apps/shellcraft-cli", "shellcraft-cli"),
+            ["`shellcraft-cli` links the UI crate `craft-ui-widgets`, which it must not link"]
+        );
+        assert_eq!(links("apps/shellcraft-agent", "shellcraft-agent"), Vec::<String>::new());
+        assert_eq!(links("apps/shellcraft-host", "shellcraftd"), links("apps/shellcraftd", "shellcraftd"), "the host has the daemon's UI rule");
+    }
+
+    #[test]
+    fn the_web_app_links_no_native_only_feature_and_the_gate_no_other_shellcraft_crate() {
+        let web = row("apps/shellcraft-web");
+        assert_eq!(web.targets, Web);
+        assert_eq!(row("apps/shellcraft-vault-worker").targets, Web);
+        assert!(Release.contains("x86_64-pc-windows-msvc") && !Release.contains(wasm::TARGET) && !Release.contains(MUSL_TARGETS[0]));
+        assert!(row("apps/shellcraft-agent").targets.contains("aarch64-unknown-linux-musl"), "the agent's static Linux build");
+        assert!(row("apps/shellcraft-agent").targets.contains("aarch64-apple-darwin"));
+        let tree = |features: &str| format!("shellcraft-web v0.1.0 (/w/apps/shellcraft-web)||\n└── craft v0.1.0|{features}|\n");
+        assert_eq!(
+            check_links("shellcraft-web", web.banned, &linked(&tree("ui,window,automation"), "shellcraft-web").unwrap()),
+            Vec::<String>::new()
+        );
+        for feature in ["update", "dialogs", "font-subset", "mcp-server", "control-agents", "automation-agents"] {
+            let problems = check_links("shellcraft-web", web.banned, &linked(&tree(&format!("ui,{feature}")), "shellcraft-web").unwrap());
+            assert_eq!(problems, [format!("`shellcraft-web` links `craft` with its `{feature}` feature, which it must not link")]);
+        }
+        let gate = "\
+shellcraft-webgate v0.1.0 (/w/apps/shellcraft-webgate)||
+├── shellcraft-proto v0.1.0 (/w/crates/proto)||
+├── shellcraft_store v0.1.0 (/w/crates/store)||
+└── shellcraftd v0.1.0 (/w/apps/shellcraftd)||
+";
+        let problems = check_links("shellcraft-webgate", row("apps/shellcraft-webgate").banned, &linked(gate, "shellcraft-webgate").unwrap());
+        assert_eq!(
+            problems,
+            [
+                "`shellcraft-webgate` links `shellcraft_store`, which it must not link",
+                "`shellcraft-webgate` links `shellcraftd`, which it must not link"
+            ]
+        );
+        let worker = gate.replace("shellcraft-webgate", "shellcraft-vault-worker");
+        let problems =
+            check_links("shellcraft-vault-worker", row("apps/shellcraft-vault-worker").banned, &linked(&worker, "shellcraft-vault-worker").unwrap());
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        let vault = "shellcraft-vault-worker v0.1.0 (/w/apps/shellcraft-vault-worker)||\n├── craft-vault-relay v0.1.0||\n└── craft-vault v0.1.0||\n";
+        let problems =
+            check_links("shellcraft-vault-worker", row("apps/shellcraft-vault-worker").banned, &linked(vault, "shellcraft-vault-worker").unwrap());
+        assert_eq!(problems, ["`shellcraft-vault-worker` links `craft-vault`, which it must not link"]);
+        // Another package with the app's name is linked like any other.
+        let namesake = "shellcraft-webgate v0.1.0 (/w/apps/shellcraft-webgate)||\n└── shellcraft-webgate v0.0.9||\n";
+        let problems = check_links("shellcraft-webgate", row("apps/shellcraft-webgate").banned, &linked(namesake, "shellcraft-webgate").unwrap());
+        assert_eq!(problems, ["`shellcraft-webgate` links `shellcraft-webgate`, which it must not link"]);
+    }
+
+    #[test]
+    fn a_craft_crate_depends_on_no_facade_and_no_shellcraft_crate_spelled_with_an_underscore() {
+        let problems = craft(&craft_manifest(), true, vec![ext(FACADE, Kind::Normal)], &[], &[]);
+        assert_eq!(problems, ["`craft-queue` depends on the `craft` facade; a craft crate depends on single craft-libs crates"]);
+        let problems = craft(&craft_manifest(), true, vec![ext("shellcraft_proto", Kind::Normal)], &[], &[]);
+        assert_eq!(problems, ["`craft-queue` depends on `shellcraft_proto`; a craft crate depends on no shellcraft crate"]);
+    }
+
+    #[test]
+    fn tells_native_target_keys_apart() {
+        for native in [
+            "cfg(not(target_arch = \"wasm32\"))",
+            "cfg(not(target_family = \"wasm\"))",
+            "cfg(windows)",
+            "cfg(unix)",
+            "cfg(target_os = \"macos\")",
+            "cfg(any(unix, windows))",
+            "cfg(all(unix, feature = \"x\"))",
+            "cfg(any(target_os = \"linux\", target_os = \"macos\",))",
+            "cfg(not(any(target_family = \"wasm\", feature = \"x\")))",
+            "cfg(any(windows, false))",
+            "cfg(false)",
+            "cfg(r#target_os = \"macos\")",
+            "x86_64-pc-windows-msvc",
+            "wasm32-wasip1",
+        ] {
+            assert!(is_native_target(native), "{native}");
+        }
+        for web in [
+            "cfg(target_arch = \"wasm32\")",
+            "cfg(target_os = \"unknown\")",
+            "cfg(any(unix, target_arch = \"wasm32\"))",
+            "cfg(feature = \"x\")",
+            "cfg(not(feature = \"x\"))",
+            "cfg(true)",
+            "cfg(all(true, not(unix)))",
+            "cfg(not(r#true))",
+            "cfg(r#false)",
+            "cfg(not(unix, windows))",
+            "cfg(any(unix windows))",
+            "cfg(target_os = \"macos)",
+            "wasm32-unknown-unknown",
+        ] {
+            assert!(!is_native_target(web), "{web}");
+        }
+    }
+
+    #[test]
+    fn a_web_crate_turns_on_native_only_facade_features_only_in_a_native_entry() {
+        let ok = r#"[package]
+name = "shellcraft-ui-egui"
+
+[dependencies]
+craft = { workspace = true, features = ["ui", "window"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+craft = { workspace = true, features = ["update", "dialogs", "font-subset"] }
+
+[features]
+web = ["craft/automation"]
+"#;
+        let workspace =
+            Document::parse("[workspace.dependencies]\ncraft = { git = \"https://example.com/craft-libs\", default-features = false }\n").unwrap();
+        let deps = workspace.get("workspace").and_then(|w| w.get("dependencies"));
+        assert_eq!(check_wasm_features("shellcraft-ui-egui", ok, deps), Vec::<String>::new());
+
+        let plain = ok.replace("[\"ui\", \"window\"]", "[\"ui\", \"update\"]");
+        let problems = check_wasm_features("shellcraft-ui-egui", &plain, deps);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(reported(&problems, &["`shellcraft-ui-egui`", "`update`", "[dependencies]"]), 1, "{problems:?}");
+        let any_target = ok.replace("cfg(not(target_arch = \"wasm32\"))", "cfg(any(unix, target_arch = \"wasm32\"))");
+        assert_eq!(check_wasm_features("shellcraft-ui-egui", &any_target, deps).len(), 3);
+        let through_feature = ok.replace("craft/automation", "craft?/dialogs");
+        let problems = check_wasm_features("shellcraft-ui-egui", &through_feature, deps);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(reported(&problems, &["`shellcraft-ui-egui`", "`web`", "`dialogs`", "`craft?/dialogs`"]), 1, "{problems:?}");
+        let renamed = r#"[dependencies]
+framework = { package = "craft", git = "https://example.com/craft-libs", features = ["font-subset"] }
+"#;
+        assert_eq!(check_wasm_features("x", renamed, None).len(), 1, "a renamed facade");
+        let dev = "[target.'cfg(target_arch = \"wasm32\")'.dev-dependencies]\ncraft = { path = \"../craft\", features = [\"dialogs\"] }\n";
+        assert_eq!(check_wasm_features("x", dev, None).len(), 1, "a dev-dependency of the web build");
+        let build = "[build-dependencies]\ncraft = { path = \"../craft\", features = [\"dialogs\"] }\n";
+        assert_eq!(check_wasm_features("x", build, None), Vec::<String>::new(), "a build-dependency builds for the host");
+        let build_forward = "[build-dependencies]\ncraft = { path = \"../craft\" }\n\n[features]\nupdater = [\"craft/update\"]\n";
+        assert_eq!(check_wasm_features("x", build_forward, None), Vec::<String>::new(), "a feature that forwards to a build-dependency");
+        let native_alias = "[target.'cfg(unix)'.dependencies]\nframework = { package = \"craft\", path = \"../craft\" }\n\n[features]\nupdater = [\"framework/update\"]\n";
+        assert_eq!(check_wasm_features("x", native_alias, None).len(), 1, "a feature of the crate that forwards to a native entry");
+        let shared = Document::parse("[workspace.dependencies]\ncraft = { path = \"craft\", features = [\"update\"] }\n").unwrap();
+        let shared = shared.get("workspace").and_then(|w| w.get("dependencies"));
+        let problems = check_wasm_features("x", "[target.'cfg(unix)'.dependencies]\ncraft.workspace = true\n", shared);
+        assert_eq!(problems.len(), 1, "the shared entry counts under a native table too: {problems:?}");
+        assert_eq!(reported(&problems, &["`x`", "`update`", "[workspace.dependencies]", "[target.'cfg(unix)'.dependencies]"]), 1, "{problems:?}");
+        let workspace_features =
+            Document::parse("[workspace.dependencies]\ncraft = { git = \"https://example.com/craft-libs\", features = [\"update\"] }\n").unwrap();
+        let deps = workspace_features.get("workspace").and_then(|w| w.get("dependencies"));
+        assert_eq!(check_wasm_features("x", "[dependencies]\ncraft.workspace = true\n", deps).len(), 1, "features from [workspace.dependencies]");
+        assert!(check_wasm_features("x", "not toml = = 1", None)[0].contains("not valid TOML"));
+    }
+
+    #[test]
+    fn the_web_build_turns_on_no_native_only_facade_feature() {
+        let tree = |features: &str| format!("shellcraft-ui-egui v0.1.0 (/w/crates/ui)||\n└── craft v0.1.0|{features}|\n");
+        let check = |features: &str| check_web_features("shellcraft-ui-egui", &linked(&tree(features), "shellcraft-ui-egui").unwrap());
+        assert_eq!(check("ui,window"), Vec::<String>::new());
+        let problems = check("ui,update,update-oci_migration");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(reported(&problems, &["`shellcraft-ui-egui`", "`update`"]), 1, "{problems:?}");
+        // The crate's own dev-dependencies are part of its web test build; another package's are not.
+        let dev = "\
+shellcraft-ui-egui v0.1.0 (/w/crates/ui)||
+└── helper v0.1.0||
+    [dev-dependencies]
+    └── craft v0.1.0|dialogs|
+[dev-dependencies]
+└── craft v0.1.0|update,update-extra|
+";
+        let problems = check_web_features("shellcraft-ui-egui", &linked_in_tests(dev, "shellcraft-ui-egui").unwrap());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(reported(&problems, &["`shellcraft-ui-egui`", "`update`"]), 1, "{problems:?}");
+        assert_eq!(check_web_features("shellcraft-ui-egui", &linked(dev, "shellcraft-ui-egui").unwrap()), Vec::<String>::new());
+    }
+
+    /// Two web crates that share `shellcraft-helper`: `shellcraft-a` turns on its optional facade
+    /// dependency and `shellcraft-b` its feature that forwards `craft?/update`. Each alone builds
+    /// without `update`; `cargo xtask wasm`'s one command builds both with it.
+    #[test]
+    fn checks_the_web_crates_together() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let root = std::env::temp_dir().join(format!("xtask-layers-web-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let write = |path: &str, text: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let inherited = "version.workspace = true\nedition.workspace = true\nrust-version.workspace = true\nlicense.workspace = true\nrepository.workspace = true\n";
+        write(
+            "Cargo.toml",
+            "[workspace]\nresolver = \"3\"\nmembers = [\"crates/a\", \"crates/b\", \"crates/helper\"]\nexclude = [\"vendor\"]\n\n\
+             [workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\nrust-version = \"1.95\"\nlicense = \"MIT OR Apache-2.0\"\nrepository = \"https://example.com/x\"\n",
+        );
+        write("AGENTS.md", "| Crate | Layer |\n|-------|-------|\n| `shellcraft-a` | L0 |\n| `shellcraft-b` | L0 |\n| `shellcraft-helper` | L0 |\n");
+        write("vendor/craft/Cargo.toml", "[package]\nname = \"craft\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[features]\nupdate = []\n");
+        write("vendor/craft/src/lib.rs", "");
+        write(
+            "crates/helper/Cargo.toml",
+            &format!(
+                "[package]\nname = \"shellcraft-helper\"\n{inherited}\n[dependencies]\ncraft = {{ path = \"../../vendor/craft\", optional = true }}\n\n\
+                 [features]\nwith-craft = [\"dep:craft\"]\nupd = [\"craft?/update\"]\n"
+            ),
+        );
+        for (name, feature) in [("a", "with-craft"), ("b", "upd")] {
+            write(
+                &format!("crates/{name}/Cargo.toml"),
+                &format!(
+                    "[package]\nname = \"shellcraft-{name}\"\n{inherited}\n[dependencies]\nshellcraft-helper = {{ path = \"../helper\", features = [\"{feature}\"] }}\n"
+                ),
+            );
+            write(&format!("crates/{name}/src/lib.rs"), "");
+        }
+        write("crates/helper/src/lib.rs", "");
+        let mut lock = runner::cargo(&root);
+        lock.args(["generate-lockfile", "--offline"]);
+        let out = lock.output().unwrap();
+        let result = if out.status.success() {
+            check_workspace(&root, &["shellcraft-a", "shellcraft-b"], &[wasm::TARGET])
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+        std::fs::remove_dir_all(&root).unwrap();
+        let (_, problems) = result.unwrap();
+        for name in ["`shellcraft-a`", "`shellcraft-b`"] {
+            assert_eq!(reported(&problems, &[name, "`update`", "together"]), 1, "{name} in {problems:#?}");
+        }
+        assert_eq!(problems.len(), 2, "{problems:#?}");
+    }
+
+    /// How many of `problems` hold every one of `words`.
+    fn reported(problems: &[String], words: &[&str]) -> usize {
+        problems.iter().filter(|p| words.iter().all(|w| p.contains(w))).count()
+    }
+
+    /// Runs the whole check on a small workspace with Cargo's real `cargo metadata` and `cargo tree`
+    /// output: a stand-in `craft` facade outside the workspace, an L0 crate in the web list that turns
+    /// on its `ui` feature, and `update` through another facade feature in a feature of its own, a
+    /// daemon that turns on `ui`, and a GUI that turns on `update` in a feature and
+    /// `automation-agents` in a test-only one.
+    #[test]
+    fn checks_a_real_workspace() {
+        // One desktop target, the agent's static Linux build and the web target.
+        const TARGETS: &[&str] = &["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", wasm::TARGET];
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let root = std::env::temp_dir().join(format!("xtask-layers-ws-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        // Cargo prints the paths it resolves, which on macOS go through `/private`.
+        let root = std::fs::canonicalize(&root).unwrap();
+        let write = |path: &str, text: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let inherited = "version.workspace = true\nedition.workspace = true\nrust-version.workspace = true\nlicense.workspace = true\nrepository.workspace = true\n";
+        write(
+            "Cargo.toml",
+            "[workspace]\nresolver = \"3\"\nmembers = [\"crates/low\", \"apps/shellcraftd\", \"apps/shellcraft\", \"apps/shellcraft-agent\"]\n\
+             exclude = [\"vendor\"]\n\n\
+             [workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\nrust-version = \"1.95\"\nlicense = \"MIT OR Apache-2.0\"\nrepository = \"https://example.com/x\"\n",
+        );
+        write(
+            "AGENTS.md",
+            "| Crate | Layer |\n|-------|-------|\n| `shellcraft-low` | L0 |\n| `shellcraft-agent` | L3 |\n| `shellcraftd` | L5 |\n| `shellcraft` | L6 |\n",
+        );
+        // The agent links `craft-keystore`, and `shellcraft-low` through a package outside the
+        // workspace, only in its static Linux build.
+        write("vendor/keystore/Cargo.toml", "[package]\nname = \"craft-keystore\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write("vendor/keystore/src/lib.rs", "");
+        write(
+            "vendor/helper/Cargo.toml",
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nshellcraft-low = { path = \"../../crates/low\" }\n",
+        );
+        write("vendor/helper/src/lib.rs", "");
+        write(
+            "apps/shellcraft-agent/Cargo.toml",
+            &format!(
+                "[package]\nname = \"shellcraft-agent\"\n{inherited}\n[target.'cfg(target_env = \"musl\")'.dependencies]\n\
+                 craft-keystore = {{ path = \"../../vendor/keystore\" }}\nhelper = {{ path = \"../../vendor/helper\" }}\n"
+            ),
+        );
+        write("apps/shellcraft-agent/src/main.rs", "fn main() {}\n");
+        write(
+            "vendor/craft/Cargo.toml",
+            "[package]\nname = \"craft\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[features]\nui = []\nupdate = []\nupdate-extra = [\"update\"]\nautomation = []\nautomation-agents = []\n",
+        );
+        write("vendor/craft/src/lib.rs", "");
+        let facade = |features: &str| format!("craft = {{ path = \"../../vendor/craft\", features = [{features}] }}\n");
+        write(
+            "crates/low/Cargo.toml",
+            &format!(
+                "[package]\nname = \"shellcraft-low\"\n{inherited}\n[dependencies]\n{}\n[features]\nweb = [\"craft/update-extra\"]\n",
+                facade("\"ui\"")
+            ),
+        );
+        write("crates/low/src/lib.rs", "");
+        write("apps/shellcraftd/Cargo.toml", &format!("[package]\nname = \"shellcraftd\"\n{inherited}\n[dependencies]\n{}", facade("\"ui\"")));
+        write("apps/shellcraftd/src/main.rs", "fn main() {}\n");
+        let gui = |default: &str| {
+            format!(
+                "[package]\nname = \"shellcraft\"\n{inherited}\n[dependencies]\n{}\n[features]\n{default}updates = [\"craft/update\"]\n\
+                 dev-automation = [\"craft/automation\"]\nscreen-testing = [\"craft/automation-agents\"]\n",
+                facade("")
+            )
+        };
+        write("apps/shellcraft/Cargo.toml", &gui(""));
+        write("apps/shellcraft/src/main.rs", "fn main() {}\n");
+        let mut lock = runner::cargo(&root);
+        lock.args(["generate-lockfile", "--offline"]);
+        let out = lock.output().unwrap();
+        let run = || {
+            if out.status.success() {
+                check_workspace(&root, &["shellcraft-low"], TARGETS)
+            } else {
+                Err(String::from_utf8_lossy(&out.stderr).into_owned())
+            }
+        };
+        let result = run();
+        // A release build, with the default features only, that turns on development automation.
+        write("apps/shellcraft/Cargo.toml", &gui("default = [\"dev-automation\"]\n"));
+        let with_default = run();
+        std::fs::remove_dir_all(&root).unwrap();
+        let (_, with_default) = with_default.unwrap();
+        let (count, problems) = result.unwrap();
+        assert_eq!(count, 4);
+        let every = format!("(on {}, {})", TARGETS[0], wasm::TARGET);
+        let release = format!("(on {})", TARGETS[0]);
+        let musl = format!("(on {})", TARGETS[1]);
+        // `shellcraft-low` is also walked for the static Linux build, which the agent links it in.
+        let low = format!("(on {}, {}, {})", TARGETS[0], TARGETS[1], wasm::TARGET);
+        let facts: [&[&str]; 8] = [
+            &["`shellcraft-low`", wasm::TARGET, "`update`"],
+            &["`shellcraft-agent`", "`craft-keystore`", &musl],
+            &["`shellcraft-agent` (L3)", "`helper`", "`ui`", &musl],
+            &["`shellcraft-agent` links", "`ui`", &musl],
+            &["`shellcraft-low` (L0)", "`ui`", &low],
+            &["`shellcraft`", "`update`", &release],
+            &["`shellcraftd` (L5)", "`ui`", &every],
+            &["`shellcraftd` links", "`ui`", &release],
+        ];
+        for fact in facts {
+            assert_eq!(reported(&problems, fact), 1, "{fact:?} in {problems:#?}");
+        }
+        assert_eq!(problems.len(), facts.len(), "{problems:#?}");
+        let added: Vec<String> = with_default.iter().filter(|p| !problems.contains(p)).cloned().collect();
+        assert_eq!(reported(&added, &["`shellcraft`", "`automation`", "release build", &release]), 1, "{added:#?}");
+        assert_eq!(added.len(), 1, "{added:#?}");
     }
 }
