@@ -1531,14 +1531,19 @@ The GUI must not link tokio.
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
         let dir = std::env::temp_dir().join(format!("xtask-layers-git-{}-{nanos}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
+        // A Git template that excludes `new.rs`; `--template=` keeps it out of both repositories.
+        let template = dir.join("template");
+        std::fs::create_dir_all(template.join("info")).unwrap();
+        std::fs::write(template.join("info/exclude"), "new.rs\n").unwrap();
         let git = |args: &[&str]| -> String {
             let mut c = std::process::Command::new("git");
-            c.env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").env_remove("GIT_CONFIG").args(args).current_dir(&dir);
+            c.env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").env_remove("GIT_CONFIG");
+            c.env("GIT_TEMPLATE_DIR", &template).args(args).current_dir(&dir);
             let out = c.output().unwrap();
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8_lossy(&out.stdout).trim().to_owned()
         };
-        git(&["init", "--quiet"]);
+        git(&["init", "--quiet", "--template="]);
         // Only the ignore rules the fixture writes, not the caller's global ones.
         std::fs::write(dir.join("no-excludes"), "").unwrap();
         git(&["config", "--local", "core.excludesFile", &dir.join("no-excludes").to_string_lossy()]);
@@ -1556,7 +1561,7 @@ The GUI must not link tokio.
         // A submodule entry, and a nested repository not added yet.
         git(&["update-index", "--add", "--cacheinfo", &format!("160000,{blob},crate/sub")]);
         std::fs::create_dir(dir.join("crate/nested")).unwrap();
-        git(&["-C", "crate/nested", "init", "--quiet"]);
+        git(&["-C", "crate/nested", "init", "--quiet", "--template="]);
         let no_hooks = format!("core.hooksPath={}", dir.join("no-hooks").display());
         let commit = ["-C", "crate/nested", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", &no_hooks];
         git(&[&commit[..], &["commit", "--quiet", "--allow-empty", "-m", "t"]].concat());
