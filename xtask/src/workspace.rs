@@ -6,13 +6,29 @@ use craft_xtask::runner;
 
 /// The names of the workspace members, from `cargo metadata --no-deps`.
 pub fn members(root: &Path) -> Result<Vec<String>, String> {
+    member_names(&metadata(root)?)
+}
+
+/// The output of `cargo metadata --no-deps --format-version 1`.
+fn metadata(root: &Path) -> Result<Vec<u8>, String> {
+    metadata_with(root, &["--no-deps"])
+}
+
+/// The output of `cargo metadata --locked --all-features --format-version 1`: the dependency graph
+/// of the whole workspace resolved with every feature of every member on, optional dependencies
+/// included.
+pub fn resolved_metadata(root: &Path) -> Result<Vec<u8>, String> {
+    metadata_with(root, &["--locked", "--all-features"])
+}
+
+fn metadata_with(root: &Path, flags: &[&str]) -> Result<Vec<u8>, String> {
     let mut c = runner::cargo(root);
-    c.args(["metadata", "--no-deps", "--format-version", "1"]);
+    c.arg("metadata").args(flags).args(["--format-version", "1"]);
     let out = c.output().map_err(|e| format!("cargo metadata: failed to spawn: {e}"))?;
     if !out.status.success() {
         return Err(format!("cargo metadata: exited with {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim()));
     }
-    member_names(&out.stdout)
+    Ok(out.stdout)
 }
 
 /// The package names in `cargo metadata --no-deps` output.
