@@ -13,8 +13,8 @@ repository = "https://github.com/blamejs/ShellCraft"
 
 [workspace.dependencies]
 # Shared Craft crates: storytold/craft-libs, MIT OR Apache-2.0, pinned to one rev.
-craft-xtask = { git = "https://github.com/storytold/craft-libs", rev = "b5014b993bbe7d6a7dd020c93a9d1a6a6621e937", features = ["report"] }
-craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "b5014b993bbe7d6a7dd020c93a9d1a6a6621e937" }
+craft-xtask = { git = "https://github.com/storytold/craft-libs", rev = "6a423aee8b0f7f9b57673bef12da29b81269b113", features = ["report"] }
+craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "6a423aee8b0f7f9b57673bef12da29b81269b113" }
 
 # The `cargo metadata` output that xtask reads.
 serde_json = "1"

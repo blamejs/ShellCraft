@@ -11,7 +11,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 [[package]]
 name = "craft-atomic"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=b5014b993bbe7d6a7dd020c93a9d1a6a6621e937#b5014b993bbe7d6a7dd020c93a9d1a6a6621e937"
+source = "git+https://github.com/storytold/craft-libs?rev=6a423aee8b0f7f9b57673bef12da29b81269b113#6a423aee8b0f7f9b57673bef12da29b81269b113"
 dependencies = [
  "rustix",
 ]
@@ -19,7 +19,7 @@ dependencies = [
 [[package]]
 name = "craft-xtask"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=b5014b993bbe7d6a7dd020c93a9d1a6a6621e937#b5014b993bbe7d6a7dd020c93a9d1a6a6621e937"
+source = "git+https://github.com/storytold/craft-libs?rev=6a423aee8b0f7f9b57673bef12da29b81269b113#6a423aee8b0f7f9b57673bef12da29b81269b113"
 dependencies = [
  "craft-atomic",
  "serde_json",
